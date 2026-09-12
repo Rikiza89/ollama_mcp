@@ -19,10 +19,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       # A venv, not --system: the runner's system Python is externally managed
-      # (PEP 668) and refuses the install.
+      # (PEP 668) and refuses the install. setup-uv already provisions a venv on
+      # some runners, so --allow-existing keeps this working either way.
       - name: Install
         run: |
-          uv venv
+          uv venv --allow-existing
           uv pip install -e ".[dev]"
       - name: Lint
         run: uv run ruff check .
