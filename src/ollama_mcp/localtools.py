@@ -17,10 +17,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import encoding
 from .config import Config
 from .sandbox import SandboxError, rel, resolve
 
 MAX_TOOL_RESULT_CHARS = 20_000
+# The same budget expressed in tokens, which is what the local model's context
+# is actually measured in. For ASCII the two caps coincide; for Japanese the
+# character cap alone let ~20k tokens of tool output into a 16k num_ctx, where
+# Ollama silently truncated it and the model edited a file it never fully saw.
+MAX_TOOL_RESULT_TOKENS = 5_000
 
 
 def schemas() -> list[dict[str, Any]]:
@@ -199,7 +205,9 @@ class ToolBelt:
         target.parent.mkdir(parents=True, exist_ok=True)
         write_text(target, content)
         self.touched.add(target)
-        return f"OK: wrote {rel(self.cfg, target)} ({len(content)} bytes)"
+        # byte_length, not len(): a Japanese file is ~3x its character count in
+        # UTF-8, and a receipt that says "bytes" should not mean "characters".
+        return f"OK: wrote {rel(self.cfg, target)} ({encoding.byte_length(content)} bytes)"
 
     def _t_grep(self, pattern: str, glob: str | None = None, max_results: int = 80) -> str:
         limit = max(1, max_results)
@@ -267,19 +275,21 @@ def _ripgrep(cfg: Config, pattern: str, glob: str | None, limit: int) -> list[st
         cmd += ["--glob", glob]
     cmd += ["-e", pattern, "."]
     try:
+        # Bytes, not text=True: ripgrep emits UTF-8 for a match in a Japanese
+        # source file no matter what the console codepage is, and decoding that
+        # with cp932 raises out of a function whose callers expect a value.
         proc = subprocess.run(
             cmd,
             cwd=cfg.workspace,
             capture_output=True,
-            text=True,
             timeout=60,
             check=False,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (subprocess.TimeoutExpired, OSError):
         return None
     if proc.returncode not in (0, 1):
-        return f"ERROR: search failed: {proc.stderr[:400]}"
-    return proc.stdout.splitlines()[:limit]
+        return f"ERROR: search failed: {encoding.decode_output(proc.stderr)[:400]}"
+    return encoding.decode_output(proc.stdout).splitlines()[:limit]
 
 
 def _line_delta(old: list[str], new: list[str]) -> tuple[int, int]:
@@ -293,9 +303,25 @@ def _line_delta(old: list[str], new: list[str]) -> tuple[int, int]:
 
 
 def _truncate(text: str) -> str:
-    if len(text) <= MAX_TOOL_RESULT_CHARS:
+    """Cap a tool result on characters *and* on estimated tokens.
+
+    The character cap bounds the transcript; the token cap bounds the local
+    model's context window, and only the second one is meaningful for CJK text.
+    Whichever bites first wins.
+    """
+    chars, tokens = len(text), encoding.estimate_tokens(text)
+    if chars <= MAX_TOOL_RESULT_CHARS and tokens <= MAX_TOOL_RESULT_TOKENS:
         return text
-    return text[:MAX_TOOL_RESULT_CHARS] + f"\n... (truncated at {MAX_TOOL_RESULT_CHARS} chars)"
+
+    keep = min(chars, MAX_TOOL_RESULT_CHARS)
+    if tokens > MAX_TOOL_RESULT_TOKENS:
+        # Tokens track characters closely enough within a single writing system
+        # for one proportional cut to land inside the budget.
+        keep = min(keep, max(1, chars * MAX_TOOL_RESULT_TOKENS // tokens))
+    return text[:keep] + (
+        f"\n... (truncated at {MAX_TOOL_RESULT_CHARS} chars / "
+        f"~{MAX_TOOL_RESULT_TOKENS} tokens)"
+    )
 
 
 def parse_args(raw: Any) -> dict[str, Any]:

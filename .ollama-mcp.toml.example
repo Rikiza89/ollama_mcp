@@ -29,3 +29,11 @@ max_local_retries = 1
 
 [sandbox]
 deny = [".git", ".env", "node_modules", ".venv", "__pycache__", ".pem", ".ollama-mcp"]
+
+[i18n]
+# Language of the prompt sent to the local model and of the prose in the receipt.
+# "auto" decides per call from the instruction text, falling back to the machine
+# locale -- a task written in Japanese gets the Japanese prompt even on an
+# English-locale machine. Status tokens (APPLIED / ESCALATE / PASS / FAIL) are
+# protocol and are never translated.
+language = "auto"   # "auto" | "en" | "ja"

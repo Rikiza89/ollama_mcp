@@ -1,5 +1,7 @@
 # ollama-mcp-delegate
 
+**日本語版: [README.ja.md](README.ja.md)** · [日本語環境での挙動](docs/ja/japanese-environment.md)
+
 An MCP server that lets **Claude Code stay the orchestrator** while a **local Ollama model does the mechanical work** — file edits, code lookups, lint triage — so that text never enters Claude's context and you pay fewer tokens for the same result.
 
 ```
@@ -122,11 +124,36 @@ max_local_retries = 1
 
 [sandbox]
 deny = [".git", ".env", "node_modules", ".venv", ".pem"]
+
+[i18n]
+language = "auto"   # "auto" | "en" | "ja"
 ```
+
+The config file is validated when it loads: an unknown key or a value of the
+wrong type stops the server with the file and the key named, rather than
+silently falling back to a default three delegations later.
 
 With no config file, the gate falls back to syntax checks on touched files plus an autodetected project check (`ruff`, `tsc --noEmit`, `cargo check`, `go build`).
 
 Keep the gate **fast**. It runs after every delegated edit, and on failure it runs again after one local retry.
+
+## Language
+
+`[i18n] language` (or `OLLAMA_MCP_LANG`) picks the language of the prompt sent to
+the local model and of the prose in the receipt. `auto`, the default, decides per
+call from the text of the instruction, falling back to the machine locale — so a
+task written in Japanese gets the Japanese prompt on an English-locale laptop,
+which is the common case.
+
+Status tokens are **never** translated. `APPLIED`, `NOT APPLIED`, `ESCALATE`,
+`PASS` and `FAIL` are protocol: every `CLAUDE.md` delegation policy in the wild
+says "a tool returning ESCALATE means the working tree is unchanged", and a
+localized token would quietly break all of them. Only the sentences around them
+change.
+
+Working in Japanese also changes a handful of things you would otherwise have to
+discover the hard way — non-UTF-8 consoles, BOMs, decomposed filenames, and what
+a token actually costs in CJK. See **[docs/ja/japanese-environment.md](docs/ja/japanese-environment.md)**.
 
 ## Tools
 
@@ -184,7 +211,7 @@ The local model writes to your real working tree. Guards, in order:
 2. `[sandbox] deny` blocks `.git`, `.env`, keys, `node_modules`, and anything else you list.
 3. Original file contents are snapshotted in memory before the first write and restored automatically if the gate fails.
 4. `local_explain` and `local_verify` run with no write tools at all.
-5. Edits preserve each file's existing line endings and UTF-8 content — no whole-file CRLF churn, and non-ASCII comments (Japanese, accented text) survive a non-UTF-8 console.
+5. Edits preserve each file's existing line endings and byte content — no whole-file CRLF churn, and non-ASCII comments (Japanese, accented text) survive a non-UTF-8 console, a BOM, or a legacy Shift-JIS encoding.
 
 Run it in a git repository anyway. In-memory rollback covers gate failures; it does not cover a model that succeeded at the wrong thing.
 
@@ -192,7 +219,7 @@ Run it in a git repository anyway. In-memory rollback covers gate failures; it d
 
 ```bash
 uv pip install -e ".[dev]"
-pytest          # runs against a fake Ollama fixture — no GPU, no models needed
+pytest          # 128 tests against a fake Ollama fixture — no GPU, no models needed
 ruff check .
 ```
 

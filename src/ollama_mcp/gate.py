@@ -20,6 +20,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import encoding
 from .config import Config
 
 MAX_OUTPUT_CHARS = 1500
@@ -65,19 +66,32 @@ def run(cfg: Config, touched: list[Path]) -> GateResult:
 
 
 def _syntax_checks(touched: list[Path]) -> list[Check]:
+    """Parse every touched file we know how to parse.
+
+    Both parsers are fed *bytes*, never pre-decoded text. That is what makes the
+    check survive a file a Japanese editor wrote: CPython's tokenizer strips a
+    UTF-8 BOM and honours a PEP 263 coding cookie (`# -*- coding: cp932 -*-`),
+    while the same content decoded as UTF-8 str arrives with a leading U+FEFF
+    and fails to parse -- a false failure, which costs a correct edit a rollback
+    and a needless escalation.
+    """
     checks: list[Check] = []
     for path in touched:
         if not path.is_file():
             continue
         suffix = path.suffix.lower()
+        if suffix not in {".py", ".json"}:
+            continue
         try:
+            raw = path.read_bytes()
             if suffix == ".py":
-                ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
-                checks.append(Check(f"syntax:{path.name}", True))
-            elif suffix == ".json":
-                json.loads(path.read_text(encoding="utf-8", errors="replace"))
-                checks.append(Check(f"syntax:{path.name}", True))
-        except (SyntaxError, ValueError) as exc:
+                ast.parse(raw, filename=str(path))
+            else:
+                # json.loads autodetects UTF-8/16/32 from bytes per RFC 8259 but
+                # still rejects a UTF-8 BOM, so strip that one ourselves.
+                json.loads(encoding.strip_bom(raw))
+            checks.append(Check(f"syntax:{path.name}", True))
+        except (SyntaxError, ValueError, OSError) as exc:
             checks.append(Check(f"syntax:{path.name}", False, str(exc)[:MAX_OUTPUT_CHARS]))
     return checks
 
@@ -95,8 +109,8 @@ def autodetect(cfg: Config) -> list[list[str]]:
     pkg = root / "package.json"
     if pkg.is_file():
         try:
-            data = json.loads(pkg.read_text(encoding="utf-8"))
-        except ValueError:
+            data = json.loads(encoding.strip_bom(pkg.read_bytes()))
+        except (ValueError, OSError):
             data = {}
         scripts = data.get("scripts", {}) or {}
         if "typecheck" in scripts:
@@ -116,11 +130,15 @@ def autodetect(cfg: Config) -> list[list[str]]:
 def _run_command(cfg: Config, cmd: list[str]) -> Check:
     name = " ".join(cmd[:3])
     try:
+        # Bytes, not text=True. `text=True` decodes with the locale encoding,
+        # which is cp932 on a Japanese Windows install; ruff, pytest and tsc all
+        # emit UTF-8 whatever the console codepage is, so the first non-ASCII
+        # byte raised UnicodeDecodeError from here -- uncaught, killing the whole
+        # delegation rather than merely failing the check.
         proc = subprocess.run(
             cmd,
             cwd=cfg.workspace,
             capture_output=True,
-            text=True,
             timeout=cfg.gate.timeout_s,
             shell=False,
             check=False,
@@ -129,6 +147,9 @@ def _run_command(cfg: Config, cmd: list[str]) -> Check:
         return Check(name, True, f"skipped: {cmd[0]} not installed")
     except subprocess.TimeoutExpired:
         return Check(name, False, f"timed out after {cfg.gate.timeout_s}s")
+    except OSError as exc:
+        return Check(name, False, f"could not run {cmd[0]}: {exc}")
 
-    output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    parts = (encoding.decode_output(proc.stdout), encoding.decode_output(proc.stderr))
+    output = "\n".join(part for part in parts if part).strip()
     return Check(name, proc.returncode == 0, output[:MAX_OUTPUT_CHARS])

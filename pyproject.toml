@@ -1,6 +1,6 @@
 [project]
 name = "ollama-mcp-delegate"
-version = "0.1.0"
+version = "0.2.0"
 description = "Delegate mechanical coding work from Claude Code to a local Ollama model, behind a verification gate."
 readme = "README.md"
 license = { text = "MIT" }

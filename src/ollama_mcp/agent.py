@@ -13,39 +13,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import encoding, i18n, localtools, metrics, sentinels, toolcalls
 from . import gate as gate_mod
-from . import localtools, metrics, toolcalls
 from .config import Config
 from .ollama_client import ChatResult, OllamaClient, OllamaError
-
-EDIT_SYSTEM = """You are a local code-editing assistant working inside a real repository.
-
-Rules, in order of importance:
-1. Do exactly what the task says. Do not refactor, rename, reformat, or "improve"
-   anything you were not asked to change.
-2. Always read a file before editing it. Copy `old_text` for edit_file verbatim from
-   what you read, including indentation.
-3. Prefer edit_file over write_file. Use write_file only for new files.
-4. Keep the surrounding style: same naming, same comment density, same idioms.
-5. When you are done, reply with plain text only -- no tool call -- in this shape:
-   DONE: <one sentence on what you changed>
-   If the task is ambiguous, impossible, or needs judgement you are not sure about,
-   reply instead with:
-   ESCALATE: <one sentence on exactly what is blocking you>
-   Escalating is a correct outcome, not a failure. Never guess."""
-
-READ_SYSTEM = """You are a local code-reading assistant working inside a real repository.
-
-Rules:
-1. Answer only from what you actually read with the tools. Never invent file names,
-   symbols, or line numbers.
-2. Read narrowly: grep first, then read only the relevant line ranges.
-3. You must not modify anything. You have no write tools.
-4. When done, reply with plain text only -- no tool call -- starting with:
-   DONE: <your answer>
-   Be dense and specific. Cite paths as path:line. Keep it under {budget} characters.
-   If you cannot answer from the repository, reply:
-   ESCALATE: <what is missing>"""
 
 
 @dataclass
@@ -64,7 +35,9 @@ class Outcome:
     local_prompt_tokens: int = 0
     local_completion_tokens: int = 0
     local_chars_consumed: int = 0
+    local_tokens_estimated: int = 0
     recovered_calls: int = 0
+    language: i18n.Language = i18n.Language.EN
 
 
 def pick_model(cfg: Config, tier: str) -> tuple[str, int]:
@@ -87,11 +60,12 @@ async def run_task(
     client = OllamaClient(cfg.ollama_host, timeout_s=cfg.limits.request_timeout_s)
     belt = localtools.ToolBelt(cfg=cfg, read_only=read_only)
 
-    system = (
-        READ_SYSTEM.format(budget=answer_budget)
-        if read_only
-        else EDIT_SYSTEM
-    )
+    # Under the default `auto`, the instruction itself picks the language: a task
+    # written in Japanese gets the Japanese prompt even on an English-locale
+    # machine, which is the common case for a Japanese developer's laptop.
+    language = i18n.resolve(cfg.i18n.language, hint=instruction)
+    strings = i18n.strings(language)
+    system = strings.read_system.format(budget=answer_budget) if read_only else strings.edit_system
     tools = [
         schema
         for schema in localtools.schemas()
@@ -104,7 +78,7 @@ async def run_task(
     ]
 
     started = time.monotonic()
-    outcome = Outcome(ok=False, escalated=False, model=model)
+    outcome = Outcome(ok=False, escalated=False, model=model, language=language)
 
     try:
         outcome = await _loop(client, cfg, belt, messages, model, num_ctx, tools, outcome)
@@ -123,10 +97,7 @@ async def run_task(
                 messages.append(
                     {
                         "role": "user",
-                        "content": (
-                            "Your change failed verification. Fix it, or reply "
-                            "ESCALATE if you cannot.\n\n" + verdict.failures()
-                        ),
+                        "content": strings.gate_retry + verdict.failures(),
                     }
                 )
                 outcome = await _loop(
@@ -140,9 +111,9 @@ async def run_task(
                 restored = belt.rollback()
                 outcome.ok = False
                 outcome.escalated = True
-                outcome.reason = (
-                    f"verification failed{' after one local retry' if retried else ''}; "
-                    f"rolled back {len(restored)} file(s)"
+                outcome.reason = strings.verify_failed.format(
+                    retry=strings.after_retry if retried else "",
+                    count=len(restored),
                 )
         if verdict.ok and not outcome.escalated:
             outcome.ok = True
@@ -158,12 +129,7 @@ async def run_task(
         messages.append(
             {
                 "role": "user",
-                "content": (
-                    "You reported DONE but the working tree is unchanged -- you never "
-                    "called edit_file or write_file. Describing the change is not making "
-                    "it. Make the edit now with the tools, or reply ESCALATE with the "
-                    "reason you cannot."
-                ),
+                "content": strings.no_edit_nudge,
             }
         )
         outcome = await _loop(client, cfg, belt, messages, model, num_ctx, tools, outcome)
@@ -176,12 +142,14 @@ async def run_task(
                 outcome.gate_failures = verdict.failures()
                 restored = belt.rollback()
                 outcome.escalated = True
-                outcome.reason = f"verification failed; rolled back {len(restored)} file(s)"
+                outcome.reason = strings.verify_failed.format(
+                    retry="", count=len(restored)
+                )
 
     if not read_only and not belt.touched and not outcome.escalated:
         outcome.ok = False
         outcome.escalated = True
-        outcome.reason = outcome.reason or "local model made no changes"
+        outcome.reason = outcome.reason or strings.no_changes
 
     outcome.files = belt.diffstat() if not read_only else []
     outcome.tool_calls = belt.calls
@@ -199,7 +167,15 @@ async def run_task(
             local_prompt_tokens=outcome.local_prompt_tokens,
             local_completion_tokens=outcome.local_completion_tokens,
             local_chars_consumed=outcome.local_chars_consumed,
+            local_tokens_estimated=outcome.local_tokens_estimated,
             receipt_chars=len(outcome.answer) + len(outcome.reason) + 200,
+            # ~50 tokens covers the fixed scaffolding of a receipt: the header,
+            # the diffstat lines and the gate summary.
+            receipt_tokens_estimated=(
+                encoding.estimate_tokens(outcome.answer)
+                + encoding.estimate_tokens(outcome.reason)
+                + 50
+            ),
             gate=outcome.gate_summary,
         ),
     )
@@ -237,14 +213,15 @@ async def _loop(
                 outcome.recovered_calls += len(calls)
 
         if not calls:
-            text = result.content
-            if text.upper().startswith("ESCALATE"):
+            # See sentinels.py: matching "ESCALATE" with startswith() reported a
+            # Japanese escalation as an answer, which is the one way this server
+            # can claim success over an unchanged working tree.
+            reply = sentinels.parse(result.content)
+            if reply.escalated:
                 outcome.escalated = True
-                outcome.reason = text.split(":", 1)[-1].strip() or text
+                outcome.reason = reply.body or result.content.strip()
             else:
-                outcome.answer = text.split(":", 1)[-1].strip() if text.upper().startswith(
-                    "DONE"
-                ) else text
+                outcome.answer = reply.body
             return outcome
 
         messages.append({"role": "assistant", "content": result.content, "tool_calls": calls})
@@ -254,6 +231,7 @@ async def _loop(
             args = localtools.parse_args(fn.get("arguments"))
             tool_result = belt.run(name, args)
             outcome.local_chars_consumed += len(tool_result)
+            outcome.local_tokens_estimated += encoding.estimate_tokens(tool_result)
             messages.append({"role": "tool", "name": name, "content": tool_result})
 
     outcome.escalated = True

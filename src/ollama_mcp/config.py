@@ -12,10 +12,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import encoding, i18n
+
 try:  # pragma: no cover - trivial
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - py310
     import tomli as tomllib  # type: ignore[no-redef]
+
+class ConfigError(ValueError):
+    """A `.ollama-mcp.toml` that cannot be trusted.
+
+    Raised at load time rather than at first use: a typo in the config file
+    should stop the server with the file and key named, not silently fall back
+    to a default three delegations later.
+    """
+
 
 CONFIG_NAME = ".ollama-mcp.toml"
 
@@ -75,6 +86,18 @@ class Limits:
 
 
 @dataclass
+class I18n:
+    """Language of the prompts sent to the local model and of the receipt prose.
+
+    `auto` decides per call from the task text, falling back to the machine
+    locale. Status tokens (APPLIED, ESCALATE, PASS, FAIL) are protocol and are
+    never translated -- see `i18n.py`.
+    """
+
+    language: str = i18n.AUTO
+
+
+@dataclass
 class Sandbox:
     deny: list[str] = field(default_factory=lambda: list(DEFAULT_DENY))
     allow_write_outside_git: bool = False
@@ -87,6 +110,7 @@ class Config:
     gate: Gate = field(default_factory=Gate)
     limits: Limits = field(default_factory=Limits)
     sandbox: Sandbox = field(default_factory=Sandbox)
+    i18n: I18n = field(default_factory=I18n)
     ollama_host: str = "http://127.0.0.1:11434"
     source: str = "defaults"
 
@@ -95,10 +119,26 @@ class Config:
         return self.workspace / ".ollama-mcp"
 
 
-def _merge(dc: Any, table: dict[str, Any]) -> None:
+def _merge(dc: Any, table: dict[str, Any], *, section: str, source: Path) -> None:
+    """Apply one TOML table onto its dataclass, rejecting anything unexpected.
+
+    Raises:
+        ConfigError: on an unknown key or a value of the wrong type. `type(...) is`
+            rather than `isinstance` on purpose -- `isinstance(True, int)` is True,
+            and `max_iterations = true` is not a configuration anyone meant.
+    """
     for key, value in table.items():
-        if hasattr(dc, key):
-            setattr(dc, key, value)
+        if not hasattr(dc, key):
+            raise ConfigError(f"{source}: [{section}] has no option {key!r}")
+        expected = type(getattr(dc, key))
+        if expected is float and type(value) is int:
+            value = float(value)
+        if type(value) is not expected:
+            raise ConfigError(
+                f"{source}: [{section}] {key} must be {expected.__name__}, "
+                f"got {type(value).__name__}"
+            )
+        setattr(dc, key, value)
 
 
 def load(workspace: str | Path) -> Config:
@@ -113,11 +153,20 @@ def load(workspace: str | Path) -> Config:
 
     path = root / CONFIG_NAME
     if path.is_file():
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-        _merge(cfg.models, data.get("models", {}))
-        _merge(cfg.gate, data.get("gate", {}))
-        _merge(cfg.limits, data.get("limits", {}))
-        _merge(cfg.sandbox, data.get("sandbox", {}))
+        # utf-8-sig, not utf-8: a Japanese Windows editor writes a BOM by default
+        # and tomllib rejects it as a parse error on line 1, column 1.
+        try:
+            data = tomllib.loads(encoding.strip_bom(path.read_bytes()).decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise ConfigError(f"{path}: cannot parse: {exc}") from exc
+        for section, target in (
+            ("models", cfg.models),
+            ("gate", cfg.gate),
+            ("limits", cfg.limits),
+            ("sandbox", cfg.sandbox),
+            ("i18n", cfg.i18n),
+        ):
+            _merge(target, data.get(section, {}), section=section, source=path)
         if "ollama_host" in data:
             cfg.ollama_host = _normalize_host(data["ollama_host"])
         cfg.source = str(path)
@@ -125,6 +174,12 @@ def load(workspace: str | Path) -> Config:
     # Env always wins, so a user can retarget models without touching the repo.
     cfg.models.fast = os.environ.get("OLLAMA_MCP_FAST_MODEL", cfg.models.fast)
     cfg.models.deep = os.environ.get("OLLAMA_MCP_DEEP_MODEL", cfg.models.deep)
+    cfg.i18n.language = os.environ.get("OLLAMA_MCP_LANG", cfg.i18n.language)
+
+    try:
+        cfg.i18n.language = i18n.normalize_setting(cfg.i18n.language)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{cfg.source}: [i18n] {exc}") from exc
     return cfg
 
 

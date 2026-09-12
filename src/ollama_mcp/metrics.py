@@ -5,8 +5,13 @@ feeling like it. Every delegated call appends one JSONL row recording how much
 text the local model consumed locally (which is what Claude did *not* have to
 read) versus how large the receipt returned to Claude was.
 
-`tokens_avoided` is a deliberate estimate -- bytes/4 is the usual rough ratio
-for code -- and it is labelled as an estimate everywhere it surfaces.
+`tokens_avoided` is a deliberate estimate and is labelled as one everywhere it
+surfaces. The estimate is script-aware (see `encoding.estimate_tokens`): the
+chars/4 ratio this used to assume holds for English source and undercounts a
+Japanese file by roughly 3x, which made the headline number an argument *against*
+delegation on exactly the repositories where it pays best. Rows written before
+that change carry only character counts, so the chars/4 path stays as a fallback
+for them.
 """
 
 from __future__ import annotations
@@ -34,13 +39,15 @@ class Record:
     local_completion_tokens: int
     local_chars_consumed: int
     receipt_chars: int
+    local_tokens_estimated: int = 0
+    receipt_tokens_estimated: int = 0
     gate: str = ""
     ts: float = field(default_factory=time.time)
 
     @property
     def tokens_avoided(self) -> int:
-        gross = self.local_chars_consumed / CHARS_PER_TOKEN
-        paid = self.receipt_chars / CHARS_PER_TOKEN
+        gross = self.local_tokens_estimated or self.local_chars_consumed / CHARS_PER_TOKEN
+        paid = self.receipt_tokens_estimated or self.receipt_chars / CHARS_PER_TOKEN
         return int(max(0.0, gross - paid))
 
 
@@ -73,7 +80,7 @@ def summarize(cfg: Config, limit: int = 500) -> dict[str, Any]:
     ok = sum(1 for r in rows if r.get("ok"))
     escalated = sum(1 for r in rows if r.get("escalated"))
     avoided = sum(int(r.get("tokens_avoided_estimate") or 0) for r in rows)
-    paid = sum(int((r.get("receipt_chars") or 0) / CHARS_PER_TOKEN) for r in rows)
+    paid = sum(_receipt_tokens(r) for r in rows)
     durations = sorted(int(r.get("duration_ms") or 0) for r in rows)
     return {
         "calls": len(rows),
@@ -83,6 +90,12 @@ def summarize(cfg: Config, limit: int = 500) -> dict[str, Any]:
         "tokens_spent_on_receipts": paid,
         "median_duration_s": round(durations[len(durations) // 2] / 1000, 1),
     }
+
+
+def _receipt_tokens(row: dict[str, Any]) -> int:
+    """Tokens spent on the receipt, falling back to chars/4 for pre-0.2 rows."""
+    estimated = int(row.get("receipt_tokens_estimated") or 0)
+    return estimated or int((row.get("receipt_chars") or 0) / CHARS_PER_TOKEN)
 
 
 def _tail(path: Path, limit: int) -> list[str]:

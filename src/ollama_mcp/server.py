@@ -20,7 +20,7 @@ from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
 
-from . import __version__, agent, config, metrics
+from . import __version__, agent, config, i18n, metrics
 from . import gate as gate_mod
 from .ollama_client import OllamaClient, OllamaError
 
@@ -30,6 +30,15 @@ Tier = Literal["fast", "deep"]
 
 
 def _receipt(outcome: agent.Outcome, *, header: str) -> str:
+    """Render the receipt the orchestrator sees.
+
+    The status tokens -- APPLIED, NOT APPLIED, ESCALATE -- and the `gate:` and
+    `local:` keys are protocol and stay ASCII in every language. Published
+    `CLAUDE.md` delegation policies say "a tool returning ESCALATE means the
+    working tree is unchanged", and translating that word would quietly break
+    every one of them. Only the sentences around the tokens are localized.
+    """
+    strings = i18n.strings(outcome.language)
     lines = [header]
     if outcome.files:
         for entry in outcome.files:
@@ -39,15 +48,16 @@ def _receipt(outcome: agent.Outcome, *, header: str) -> str:
     if outcome.gate_summary:
         lines.append(f"gate: {outcome.gate_summary}")
     lines.append(
-        f"local: {outcome.model}, {outcome.iterations} steps, {outcome.duration_ms / 1000:.1f}s, "
-        f"{outcome.local_chars_consumed // 4} tok of file text read locally (est.)"
+        f"local: {outcome.model}, {outcome.iterations} {strings.steps}, "
+        f"{outcome.duration_ms / 1000:.1f}s, "
+        f"{outcome.local_tokens_estimated} {strings.tokens_read_locally}"
     )
     if outcome.escalated:
         lines.append(f"ESCALATE: {outcome.reason}")
         if outcome.gate_failures:
-            lines.append("verifier said:")
+            lines.append(strings.verifier_said)
             lines.append(outcome.gate_failures[:1200])
-        lines.append("-> The working tree is unchanged. Handle this one yourself.")
+        lines.append(strings.tree_unchanged)
     return "\n".join(lines)
 
 
@@ -154,11 +164,9 @@ async def local_verify(workspace_root: str, triage: bool = True) -> str:
     """
     cfg = _load(workspace_root)
     verdict = gate_mod.run(cfg, touched=[])
+    strings = i18n.strings(i18n.resolve(cfg.i18n.language))
     if verdict.skipped:
-        return (
-            "No gate configured and nothing autodetected.\n"
-            f"Add a [gate] section to {cfg.workspace / config.CONFIG_NAME}."
-        )
+        return strings.no_gate_configured.format(path=cfg.workspace / config.CONFIG_NAME)
     if verdict.ok:
         return f"PASS ({verdict.summary()})"
 
@@ -169,12 +177,7 @@ async def local_verify(workspace_root: str, triage: bool = True) -> str:
     outcome = await agent.run_task(
         cfg,
         tool_name="local_verify",
-        instruction=(
-            "The project's checks failed. Below is the raw output. List each distinct "
-            "problem as one line: `path:line - what is wrong - suggested fix`. "
-            "Group duplicates. Do not use any tools unless you need to read a file "
-            "to understand an error.\n\n" + raw[:12000]
-        ),
+        instruction=strings.triage_instruction + raw[:12000],
         tier="fast",
         read_only=True,
         answer_budget=1500,
@@ -198,32 +201,40 @@ async def local_status(workspace_root: str) -> str:
         gate configuration, and estimated tokens avoided so far.
     """
     cfg = _load(workspace_root)
+    language = i18n.resolve(cfg.i18n.language)
+    strings = i18n.strings(language)
     client = OllamaClient(cfg.ollama_host)
     try:
         health = await client.health()
     except OllamaError as exc:
-        return f"UNAVAILABLE: {exc}\nStart Ollama, or do this work yourself."
+        return f"UNAVAILABLE: {exc}\n{strings.ollama_unavailable}"
 
     installed = set(health["models"])
     tiers = []
     for label, name in (("fast", cfg.models.fast), ("deep", cfg.models.deep)):
-        mark = "ok" if name in installed else f"MISSING (run: ollama pull {name})"
+        mark = strings.model_ok if name in installed else strings.model_missing.format(model=name)
         tiers.append(f"  {label}: {name} -- {mark}")
 
     commands = cfg.gate.commands or gate_mod.autodetect(cfg)
     gate_desc = (
-        "\n".join(f"  {' '.join(c)}" for c in commands) if commands else "  (syntax checks only)"
+        "\n".join(f"  {' '.join(c)}" for c in commands) if commands else f"  {strings.gate_syntax_only}"
     )
+
+    # Surfaced so a delegation answering in an unexpected language is one call to
+    # diagnose, rather than a mystery about the model.
+    configured = cfg.i18n.language
+    resolved = f"{language.value} (from {configured})" if configured == i18n.AUTO else language.value
 
     return "\n".join(
         [
             f"Ollama {health['version']} at {cfg.ollama_host}",
-            f"config: {cfg.source}",
-            "models:",
+            f"{strings.label_config}: {cfg.source}",
+            f"{strings.label_language}: {resolved}",
+            f"{strings.label_models}:",
             *tiers,
-            "gate:",
+            f"{strings.label_gate}:",
             gate_desc,
-            "savings so far: " + json.dumps(metrics.summarize(cfg)),
+            f"{strings.label_savings}: " + json.dumps(metrics.summarize(cfg), ensure_ascii=False),
         ]
     )
 
