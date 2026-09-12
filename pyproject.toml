@@ -1,0 +1,46 @@
+[project]
+name = "ollama-mcp-delegate"
+version = "0.1.0"
+description = "Delegate mechanical coding work from Claude Code to a local Ollama model, behind a verification gate."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Rikiza89" }]
+keywords = ["mcp", "ollama", "claude-code", "llm", "local-inference"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Code Generators",
+]
+dependencies = [
+  "mcp>=2.0.0",
+  "httpx>=0.27",
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+
+[project.scripts]
+ollama-mcp = "ollama_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/Rikiza89/ollama_mcp"
+Issues = "https://github.com/Rikiza89/ollama_mcp/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ollama_mcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

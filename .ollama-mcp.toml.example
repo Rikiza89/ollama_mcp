@@ -1,0 +1,31 @@
+# Copy to `.ollama-mcp.toml` in your project root.
+# Only [gate] really matters -- it is the one thing that cannot be inferred safely.
+
+[gate]
+# Run in the workspace root after every delegated edit. Non-zero exit = failure,
+# which rolls the edit back and escalates to Claude. Keep these FAST.
+commands = [
+  ["ruff", "check", "--quiet", "."],
+]
+timeout_s = 180
+# Fall back to language-native checks when `commands` is empty.
+autodetect = true
+
+[models]
+fast = "qwen2.5-coder:7b"
+deep = "qwen3-coder:30b"
+# Ollama defaults num_ctx to 4096 and truncates SILENTLY. Always set it.
+fast_num_ctx = 16384
+deep_num_ctx = 32768
+keep_alive = "10m"
+temperature = 0.1
+
+[limits]
+max_iterations = 12
+request_timeout_s = 900
+max_receipt_chars = 4000
+max_file_bytes = 400000
+max_local_retries = 1
+
+[sandbox]
+deny = [".git", ".env", "node_modules", ".venv", "__pycache__", ".pem", ".ollama-mcp"]
