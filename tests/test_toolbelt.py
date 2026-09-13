@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from ollama_mcp import config
-from ollama_mcp.localtools import ToolBelt, parse_args, schemas
+from ollama_mcp.localtools import FINISH, ToolBelt, parse_args, schemas
 
 
 @pytest.fixture()
@@ -16,7 +16,25 @@ def belt(tmp_path: Path) -> ToolBelt:
 
 def test_belt_is_small() -> None:
     # A wide belt degrades small models and costs them context. Hold the line.
-    assert len(schemas()) <= 5
+    # Five capability tools plus `finish`, which is protocol rather than
+    # capability: it is what moves the verdict off the prose channel, and it
+    # pays for its slot by removing the guesswork that channel required.
+    assert len(schemas()) <= 6
+    capability = [t["function"]["name"] for t in schemas() if t["function"]["name"] != FINISH]
+    assert len(capability) <= 5
+
+
+def test_finish_only_admits_the_two_verdicts() -> None:
+    finish = next(t for t in schemas() if t["function"]["name"] == FINISH)
+    params = finish["function"]["parameters"]
+    assert params["properties"]["status"]["enum"] == ["done", "escalate"]
+    assert set(params["required"]) == {"status", "summary"}
+
+
+def test_finish_is_not_a_belt_handler(belt: ToolBelt) -> None:
+    # The agent loop intercepts it; reaching the belt would mean the loop missed
+    # the verdict and carried on as though the task were still running.
+    assert not hasattr(belt, f"_t_{FINISH}")
 
 
 def test_read_file_numbers_lines(belt: ToolBelt) -> None:

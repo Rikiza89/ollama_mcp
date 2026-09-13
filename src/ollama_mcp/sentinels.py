@@ -13,8 +13,18 @@ an *answer*. So the keyword set is bilingual, the separator set includes the
 fullwidth colon, and the usual markdown dressing (`**DONE:**`, a fenced line) is
 stripped before matching.
 
-The prompts still demand the ASCII keyword. This is the safety net for when a
-7B model ignores that, which it does.
+The verdict now arrives through the `finish` tool -- a structured field on the
+native tool-calling channel, kept apart from the model's prose. Everything below
+is the fallback for models that ignore that channel, which plenty do.
+
+Both routes share one rule, and it is the important one: **only an explicit
+success marker means success.** Absence of a failure marker is not evidence that
+the task went well. Reading it the other way round -- "no ESCALATE, therefore
+APPLIED" -- puts the cost of every misread on the dangerous side: an untouched or
+half-edited tree reported as done. Read this way, a misread costs one needless
+"do it yourself", and the tree is guaranteed intact either way.
+
+Credit for pinning down the direction of that asymmetry: @Skillselion.
 """
 
 from __future__ import annotations
@@ -43,6 +53,24 @@ class Verdict(Enum):
     DONE = "done"
     ESCALATE = "escalate"
     UNKNOWN = "unknown"
+
+
+# Values the `finish` tool's status field may use for success. Anything else --
+# a typo, an invented status, a missing field -- is an escalation by default.
+_STATUS_DONE = frozenset({"done", "complete", "completed", "success", "ok", "完了"})
+
+
+def from_status(raw: object) -> Verdict:
+    """Map the `finish` tool's `status` argument onto a verdict.
+
+    Only a recognised success value returns DONE. A missing field, a non-string,
+    or a status the model invented all return ESCALATE -- the structured channel
+    exists so that the safe direction is the default one, not so that we trust
+    whatever turns up in it.
+    """
+    if not isinstance(raw, str):
+        return Verdict.ESCALATE
+    return Verdict.DONE if raw.strip().lower() in _STATUS_DONE else Verdict.ESCALATE
 
 
 @dataclass(frozen=True)

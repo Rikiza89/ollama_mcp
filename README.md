@@ -219,7 +219,7 @@ Run it in a git repository anyway. In-memory rollback covers gate failures; it d
 
 ```bash
 uv pip install -e ".[dev]"
-pytest          # 128 tests against a fake Ollama fixture — no GPU, no models needed
+pytest          # 143 tests against a fake Ollama fixture — no GPU, no models needed
 ruff check .
 ```
 

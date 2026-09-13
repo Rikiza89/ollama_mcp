@@ -37,7 +37,7 @@ only need the verdict and what broke.
 
 ```bash
 uv pip install -e ".[dev]"
-pytest          # 128 tests, fake Ollama fixture, no GPU needed
+pytest          # 143 tests, fake Ollama fixture, no GPU needed
 ruff check .
 ```
 

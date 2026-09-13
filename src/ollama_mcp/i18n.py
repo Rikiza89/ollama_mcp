@@ -97,14 +97,16 @@ Rules, in order of importance:
 5. Preserve the language and encoding of text already in the file. If a comment or
    docstring is in Japanese, leave it in Japanese unless the task says otherwise.
    Never convert a file's character encoding or its line endings.
-6. When you are done, reply with plain text only -- no tool call -- in this shape:
-   DONE: <one sentence on what you changed>
-   If the task is ambiguous, impossible, or needs judgement you are not sure about,
-   reply instead with:
-   ESCALATE: <one sentence on exactly what is blocking you>
-   Escalating is a correct outcome, not a failure. Never guess.
-   Write the sentence in the same language as the task, but keep the leading
-   `DONE:` / `ESCALATE:` keyword in ASCII exactly as shown."""
+6. End the task by calling the `finish` tool exactly once, as your last action:
+   finish(status="done", summary="<one sentence on what you changed>")
+   Use status="escalate" if the task is ambiguous, impossible, or needs judgement
+   you are not sure about, with the reason as the summary. Escalating is a
+   correct outcome, not a failure. Never guess.
+   If you cannot call the tool, reply in plain text with exactly
+   `DONE: <summary>` or `ESCALATE: <reason>`, keeping those keywords in ASCII.
+   Write the summary itself in the same language as the task.
+   Any reply the server cannot read as one of those two is treated as an
+   escalation, so state it plainly."""
 
 EDIT_SYSTEM_JA = """あなたは実際のリポジトリの中で作業する、ローカルのコード編集アシスタントです。
 
@@ -117,14 +119,16 @@ EDIT_SYSTEM_JA = """あなたは実際のリポジトリの中で作業する、
 4. 周囲のスタイルを保つ。命名、コメントの量、書き方を既存のコードに合わせる。
 5. ファイルに既にある文章の言語と文字コードを保持する。コメントや docstring が
    日本語なら、指示がない限り日本語のまま残す。文字コードや改行コードを変換しない。
-6. 終わったらツールを呼ばず、プレーンテキストで次の形だけを返す。
-   DONE: <何を変更したかを一文で>
-   指示があいまいな場合、実行できない場合、自信のない判断が必要な場合は、代わりに
-   次を返す。
-   ESCALATE: <何が障害になっているかを一文で>
-   エスカレーションは失敗ではなく正しい結果です。推測で進めないこと。
-   説明の文は指示と同じ言語で書いてよいが、先頭の `DONE:` / `ESCALATE:` は
-   必ずここに示したとおり半角英字のまま書くこと。"""
+6. 終わったら `finish` ツールをちょうど一度だけ呼んで終了する。これが最後の行動。
+   finish(status="done", summary="<何を変更したかを一文で>")
+   指示があいまい、実行できない、自信のない判断が必要 —— そのいずれかなら
+   status="escalate" を使い、理由を summary に書く。エスカレーションは失敗では
+   なく正しい結果です。推測で進めないこと。
+   ツールを呼べない場合は、プレーンテキストで `DONE: <要約>` または
+   `ESCALATE: <理由>` とだけ返す。キーワードは必ず半角英字のまま書くこと。
+   summary 自体は指示と同じ言語で書いてよい。
+   サーバーがこの 2 つのどちらとも読み取れなかった応答は、すべてエスカレーション
+   として扱われます。はっきり書いてください。"""
 
 READ_SYSTEM_EN = """You are a local code-reading assistant working inside a real repository.
 
@@ -134,12 +138,14 @@ Rules:
 2. Read narrowly: grep first, then read only the relevant line ranges.
 3. You must not modify anything. You have no write tools.
 4. Answer in the same language the question was asked in.
-5. When done, reply with plain text only -- no tool call -- starting with:
-   DONE: <your answer>
-   Be dense and specific. Cite paths as path:line. Keep it under {budget} characters.
-   If you cannot answer from the repository, reply:
-   ESCALATE: <what is missing>
-   Keep the leading `DONE:` / `ESCALATE:` keyword in ASCII exactly as shown."""
+5. End by calling the `finish` tool exactly once:
+   finish(status="done", summary="<your answer>")
+   Be dense and specific. Cite paths as path:line. Keep the summary under
+   {budget} characters. If you cannot answer from what you read, call it with
+   status="escalate" and say what is missing -- do not guess.
+   If you cannot call the tool, reply in plain text starting with exactly
+   `DONE: ` or `ESCALATE: ` in ASCII. Any other reply is treated as an
+   escalation."""
 
 READ_SYSTEM_JA = """あなたは実際のリポジトリの中で作業する、ローカルのコード読解アシスタントです。
 
@@ -149,12 +155,14 @@ READ_SYSTEM_JA = """あなたは実際のリポジトリの中で作業する、
 2. 狭く読む。まず grep し、必要な行範囲だけを read_file する。
 3. 何も変更してはならない。書き込み系のツールは渡されていない。
 4. 質問された言語と同じ言語で答える。
-5. 終わったらツールを呼ばず、プレーンテキストで次の形から始める。
-   DONE: <答え>
-   具体的かつ簡潔に。パスは path:line の形で示す。{budget} 文字以内に収める。
-   リポジトリから答えられない場合は次を返す。
-   ESCALATE: <何が不足しているか>
-   先頭の `DONE:` / `ESCALATE:` は必ずここに示したとおり半角英字のまま書くこと。"""
+5. 終わったら `finish` ツールをちょうど一度だけ呼んで終了する。
+   finish(status="done", summary="<答え>")
+   具体的かつ簡潔に。パスは path:line の形で示す。summary は {budget} 文字以内。
+   読んだ内容から答えられない場合は status="escalate" で呼び、何が不足している
+   かを書く。推測で答えないこと。
+   ツールを呼べない場合は、プレーンテキストで `DONE: ` または `ESCALATE: ` から
+   始める。キーワードは半角英字のまま。それ以外の応答はすべてエスカレーション
+   として扱われます。"""
 
 
 @dataclass(frozen=True)
@@ -172,6 +180,9 @@ class Strings:
     verify_failed: str
     after_retry: str
     no_changes: str
+    restate_verdict: str
+    unclear_verdict: str
+    rolled_back: str
     triage_instruction: str
     no_gate_configured: str
     ollama_unavailable: str
@@ -200,6 +211,14 @@ _EN = Strings(
         "edit_file or write_file. Describing the change is not making it. Make the "
         "edit now with the tools, or reply ESCALATE with the reason you cannot."
     ),
+    restate_verdict=(
+        "I could not tell from that reply whether you finished the task or are "
+        "handing it back. Call the `finish` tool now with status=\"done\" or "
+        "status=\"escalate\", or reply with exactly `DONE: <summary>` or "
+        "`ESCALATE: <reason>`. Nothing else."
+    ),
+    unclear_verdict="local model never gave a clear verdict; treated as an escalation",
+    rolled_back="rolled back {count} file(s)",
     verify_failed="verification failed{retry}; rolled back {count} file(s)",
     after_retry=" after one local retry",
     no_changes="local model made no changes",
@@ -240,6 +259,14 @@ _JA = Strings(
         "ありません。今すぐツールで編集するか、できない理由を添えて ESCALATE と"
         "返してください。"
     ),
+    restate_verdict=(
+        "その返答からは、作業を終えたのか、こちらに差し戻したのかが判断できません"
+        "でした。今すぐ `finish` ツールを status=\"done\" または status=\"escalate\" "
+        "で呼ぶか、`DONE: <要約>` もしくは `ESCALATE: <理由>` とだけ返してください。"
+        "それ以外は書かないでください。"
+    ),
+    unclear_verdict="ローカルモデルが明確な判定を返さなかったため、エスカレーションとして扱いました",
+    rolled_back="{count} 件のファイルをロールバックしました",
     verify_failed="検証に失敗しました{retry}。{count} 件のファイルをロールバックしました",
     after_retry="(ローカルで1回再試行後)",
     no_changes="ローカルモデルは何も変更しませんでした",

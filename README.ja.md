@@ -213,7 +213,7 @@ RTX 5050 Laptop（8 GB VRAM）+ Ryzen 7 260 + 32 GB RAM での実測、4 つの�
 
 ```bash
 uv pip install -e ".[dev]"
-pytest          # 偽 Ollama フィクスチャに対して 128 テスト — GPU もモデルも不要
+pytest          # 偽 Ollama フィクスチャに対して 143 テスト — GPU もモデルも不要
 ruff check .
 ```
 

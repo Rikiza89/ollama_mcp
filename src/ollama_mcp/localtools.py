@@ -28,6 +28,11 @@ MAX_TOOL_RESULT_CHARS = 20_000
 # Ollama silently truncated it and the model edited a file it never fully saw.
 MAX_TOOL_RESULT_TOKENS = 5_000
 
+# The verdict tool. Handled in the agent loop rather than by the belt: calling it
+# ends the task, so it has no result to hand back to the model. Named here so the
+# loop and the schema cannot drift apart.
+FINISH = "finish"
+
 
 def schemas() -> list[dict[str, Any]]:
     def tool(name: str, desc: str, props: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -84,6 +89,26 @@ def schemas() -> list[dict[str, Any]]:
             "List files under a directory (recursive, workspace-relative).",
             {"path": {"type": "string", "description": "Default is the workspace root."}},
             [],
+        ),
+        tool(
+            FINISH,
+            "End the task. Call this exactly once, as your very last action. Use "
+            'status="done" ONLY if you actually finished what was asked. Use '
+            'status="escalate" for everything else -- the task is ambiguous, you '
+            "could not do it, or you are not certain you did it right. Escalating "
+            "is a correct outcome, not a failure; guessing is not.",
+            {
+                "status": {
+                    "type": "string",
+                    "enum": ["done", "escalate"],
+                    "description": 'Exactly "done" or "escalate".',
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "One sentence: what you changed, or what is blocking you.",
+                },
+            },
+            ["status", "summary"],
         ),
     ]
 

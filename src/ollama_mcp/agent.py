@@ -16,7 +16,9 @@ from typing import Any
 from . import encoding, i18n, localtools, metrics, sentinels, toolcalls
 from . import gate as gate_mod
 from .config import Config
+from .i18n import Strings
 from .ollama_client import ChatResult, OllamaClient, OllamaError
+from .sentinels import Verdict
 
 
 @dataclass
@@ -38,6 +40,9 @@ class Outcome:
     local_tokens_estimated: int = 0
     recovered_calls: int = 0
     language: i18n.Language = i18n.Language.EN
+    # True only when the local model gave an explicit success verdict. Never
+    # inferred from the absence of an escalation -- see sentinels.py.
+    finished: bool = False
 
 
 def pick_model(cfg: Config, tier: str) -> tuple[str, int]:
@@ -81,7 +86,7 @@ async def run_task(
     outcome = Outcome(ok=False, escalated=False, model=model, language=language)
 
     try:
-        outcome = await _loop(client, cfg, belt, messages, model, num_ctx, tools, outcome)
+        outcome = await _loop(client, cfg, belt, messages, model, num_ctx, tools, outcome, strings)
     except OllamaError as exc:
         outcome.escalated = True
         outcome.reason = str(exc)
@@ -101,7 +106,7 @@ async def run_task(
                     }
                 )
                 outcome = await _loop(
-                    client, cfg, belt, messages, model, num_ctx, tools, outcome
+                    client, cfg, belt, messages, model, num_ctx, tools, outcome, strings
                 )
                 verdict = gate_mod.run(cfg, sorted(belt.touched))
                 outcome.gate_summary = verdict.summary()
@@ -115,11 +120,11 @@ async def run_task(
                     retry=strings.after_retry if retried else "",
                     count=len(restored),
                 )
-        if verdict.ok and not outcome.escalated:
+        if verdict.ok and outcome.finished and not outcome.escalated:
             outcome.ok = True
 
     if read_only and not outcome.escalated:
-        outcome.ok = bool(outcome.answer)
+        outcome.ok = outcome.finished and bool(outcome.answer)
 
     if not read_only and not belt.touched and not outcome.escalated:
         # Small models sometimes narrate the change and report DONE without ever
@@ -132,11 +137,11 @@ async def run_task(
                 "content": strings.no_edit_nudge,
             }
         )
-        outcome = await _loop(client, cfg, belt, messages, model, num_ctx, tools, outcome)
+        outcome = await _loop(client, cfg, belt, messages, model, num_ctx, tools, outcome, strings)
         if belt.touched and not outcome.escalated:
             verdict = gate_mod.run(cfg, sorted(belt.touched))
             outcome.gate_summary = verdict.summary()
-            if verdict.ok:
+            if verdict.ok and outcome.finished:
                 outcome.ok = True
             else:
                 outcome.gate_failures = verdict.failures()
@@ -150,6 +155,18 @@ async def run_task(
         outcome.ok = False
         outcome.escalated = True
         outcome.reason = outcome.reason or strings.no_changes
+
+    # The receipt states in as many words that an escalation leaves the working
+    # tree untouched, and CLAUDE.md policies tell Claude to act on that. So it has
+    # to hold on *every* escalation path -- including a model that edited files
+    # and only then decided to hand the task back, which previously skipped the
+    # gate block entirely and left those edits in place under an ESCALATE header.
+    if outcome.escalated and belt.touched:
+        restored = belt.rollback()
+        if restored:
+            outcome.reason = (
+                f"{outcome.reason}; {strings.rolled_back.format(count=len(restored))}"
+            ).lstrip("; ")
 
     outcome.files = belt.diffstat() if not read_only else []
     outcome.tool_calls = belt.calls
@@ -182,6 +199,17 @@ async def run_task(
     return outcome
 
 
+def _settle(outcome: Outcome, verdict: Verdict, body: str, strings: Strings) -> Outcome:
+    """Record a verdict. Only DONE counts as success; everything else hands back."""
+    if verdict is Verdict.DONE:
+        outcome.finished = True
+        outcome.answer = body
+    else:
+        outcome.escalated = True
+        outcome.reason = body or strings.unclear_verdict
+    return outcome
+
+
 async def _loop(
     client: OllamaClient,
     cfg: Config,
@@ -191,7 +219,9 @@ async def _loop(
     num_ctx: int,
     tools: list[dict[str, Any]],
     outcome: Outcome,
+    strings: Strings,
 ) -> Outcome:
+    clarified = False
     for _ in range(cfg.limits.max_iterations):
         outcome.iterations += 1
         result: ChatResult = await client.chat(
@@ -212,27 +242,46 @@ async def _loop(
             if calls:
                 outcome.recovered_calls += len(calls)
 
-        if not calls:
-            # See sentinels.py: matching "ESCALATE" with startswith() reported a
-            # Japanese escalation as an answer, which is the one way this server
-            # can claim success over an unchanged working tree.
-            reply = sentinels.parse(result.content)
-            if reply.escalated:
-                outcome.escalated = True
-                outcome.reason = reply.body or result.content.strip()
-            else:
-                outcome.answer = reply.body
-            return outcome
+        if calls:
+            messages.append(
+                {"role": "assistant", "content": result.content, "tool_calls": calls}
+            )
+            for call in calls:
+                fn = call.get("function", {}) or {}
+                name = fn.get("name", "")
+                args = localtools.parse_args(fn.get("arguments"))
+                if name == localtools.FINISH:
+                    # The verdict arrived on the structured channel. Stop here --
+                    # finish has no result to feed back, and anything the model
+                    # queued after it is not part of the task.
+                    belt.calls.append(name)
+                    return _settle(
+                        outcome,
+                        sentinels.from_status(args.get("status")),
+                        str(args.get("summary") or "").strip(),
+                        strings,
+                    )
+                tool_result = belt.run(name, args)
+                outcome.local_chars_consumed += len(tool_result)
+                outcome.local_tokens_estimated += encoding.estimate_tokens(tool_result)
+                messages.append({"role": "tool", "name": name, "content": tool_result})
+            continue
 
-        messages.append({"role": "assistant", "content": result.content, "tool_calls": calls})
-        for call in calls:
-            fn = call.get("function", {}) or {}
-            name = fn.get("name", "")
-            args = localtools.parse_args(fn.get("arguments"))
-            tool_result = belt.run(name, args)
-            outcome.local_chars_consumed += len(tool_result)
-            outcome.local_tokens_estimated += encoding.estimate_tokens(tool_result)
-            messages.append({"role": "tool", "name": name, "content": tool_result})
+        # No tool call: fall back to reading a verdict out of the prose.
+        reply = sentinels.parse(result.content)
+        if reply.verdict is not Verdict.UNKNOWN:
+            return _settle(outcome, reply.verdict, reply.body or result.content.strip(), strings)
+
+        # Unreadable. Ask once for a verdict in a form we can trust, then fail
+        # safe. Treating "no ESCALATE found" as success is what made an untouched
+        # tree look like a finished task.
+        if clarified:
+            outcome.escalated = True
+            outcome.reason = strings.unclear_verdict
+            return outcome
+        clarified = True
+        messages.append({"role": "assistant", "content": result.content})
+        messages.append({"role": "user", "content": strings.restate_verdict})
 
     outcome.escalated = True
     outcome.reason = f"local model hit the {cfg.limits.max_iterations}-step limit without finishing"
