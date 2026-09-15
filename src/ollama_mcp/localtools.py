@@ -113,6 +113,41 @@ def schemas() -> list[dict[str, Any]]:
     ]
 
 
+def _parameter_types() -> dict[str, dict[str, str]]:
+    return {
+        tool["function"]["name"]: {
+            key: spec.get("type", "string")
+            for key, spec in tool["function"]["parameters"]["properties"].items()
+        }
+        for tool in schemas()
+    }
+
+
+PARAMETER_TYPES = _parameter_types()
+
+
+def coerce_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Give text-channel arguments the types the schema declares.
+
+    The native tool-calling channel delivers a typed JSON object. A call
+    recovered from the message body does not: every value arrives as a string,
+    so `start_line` turns up as "45" and `max(1, "45")` raises TypeError from
+    inside the handler -- reported to the model as a bad-arguments error it has
+    no way to act on, since the call it made was perfectly correct.
+    """
+    types = PARAMETER_TYPES.get(name, {})
+    out: dict[str, Any] = {}
+    for key, value in args.items():
+        declared = types.get(key)
+        if isinstance(value, str) and declared in {"integer", "number"}:
+            try:
+                value = int(value.strip()) if declared == "integer" else float(value.strip())
+            except ValueError:
+                pass  # leave it; the handler reports a better error than we can
+        out[key] = value
+    return out
+
+
 def read_source(path: Path) -> tuple[str, str]:
     """Read a file as text plus the codec that decoded it.
 
@@ -165,6 +200,7 @@ class ToolBelt:
     # -- dispatch ---------------------------------------------------------
     def run(self, name: str, args: dict[str, Any]) -> str:
         self.calls.append(name)
+        args = coerce_args(name, args)
         handler = getattr(self, f"_t_{name}", None)
         if handler is None:
             return f"ERROR: unknown tool {name!r}"
