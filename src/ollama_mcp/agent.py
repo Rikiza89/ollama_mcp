@@ -140,7 +140,7 @@ async def run_task(
         outcome.reason = str(exc)
 
     if not read_only and belt.touched and not outcome.escalated:
-        verdict = await asyncio.to_thread(gate_mod.run, cfg, sorted(belt.touched))
+        verdict = await asyncio.to_thread(gate_mod.run, cfg, sorted(belt.touched), belt.originals)
         outcome.gate_summary = verdict.summary()
         if not verdict.ok:
             outcome.gate_failures = verdict.failures()
@@ -156,7 +156,7 @@ async def run_task(
                 outcome = await _loop(
                     client, cfg, belt, messages, model, num_ctx, tools, outcome, strings
                 )
-                verdict = await asyncio.to_thread(gate_mod.run, cfg, sorted(belt.touched))
+                verdict = await asyncio.to_thread(gate_mod.run, cfg, sorted(belt.touched), belt.originals)
                 outcome.gate_summary = verdict.summary()
                 outcome.gate_failures = verdict.failures()
 
@@ -187,7 +187,7 @@ async def run_task(
         )
         outcome = await _loop(client, cfg, belt, messages, model, num_ctx, tools, outcome, strings)
         if belt.touched and not outcome.escalated:
-            verdict = await asyncio.to_thread(gate_mod.run, cfg, sorted(belt.touched))
+            verdict = await asyncio.to_thread(gate_mod.run, cfg, sorted(belt.touched), belt.originals)
             outcome.gate_summary = verdict.summary()
             if verdict.ok and outcome.finished:
                 outcome.ok = True
