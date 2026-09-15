@@ -9,6 +9,8 @@ containment is the entire point: it is what converts "a second model" into
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,10 +41,56 @@ class Outcome:
     local_chars_consumed: int = 0
     local_tokens_estimated: int = 0
     recovered_calls: int = 0
+    # How many old tool results had to be dropped to keep the transcript inside
+    # the local model's context window. Non-zero means it was working from a
+    # partial view, which is worth knowing when a result looks wrong.
+    elided_results: int = 0
     language: i18n.Language = i18n.Language.EN
     # True only when the local model gave an explicit success verdict. Never
     # inferred from the absence of an escalation -- see sentinels.py.
     finished: bool = False
+
+
+# Fraction of num_ctx the transcript may occupy. The rest is headroom for the
+# model's own reply and for whatever the chat template adds around each message.
+CONTEXT_BUDGET = 0.75
+
+ELIDED = "[earlier tool result dropped to fit the local model's context window]"
+
+
+def _fit_context(messages: list[dict[str, Any]], tools: list[dict[str, Any]], num_ctx: int) -> int:
+    """Blank out the oldest tool results until the transcript fits `num_ctx`.
+
+    Capping each individual tool result, which `localtools` already does, does
+    not cap their sum: twelve iterations of a 5,000-token result is 60,000
+    tokens going into a 16,384-token window, where Ollama truncates it silently
+    and the model edits a file it never fully saw. That silent truncation is the
+    single failure this server most needs not to have, so the transcript gets a
+    budget of its own.
+
+    The messages themselves are kept and only their *content* is replaced, so
+    every `tool` message still lines up with the `tool_calls` that produced it.
+    Dropping them outright would reclaim a few more tokens and leave the chat
+    template rendering an assistant turn whose calls have no results.
+
+    Returns:
+        The number of results newly elided.
+    """
+    budget = int(num_ctx * CONTEXT_BUDGET) - encoding.estimate_tokens(json.dumps(tools))
+    total = sum(encoding.estimate_tokens(str(m.get("content") or "")) for m in messages)
+    elided = 0
+    for message in messages:  # oldest first
+        if total <= budget:
+            break
+        if message.get("role") != "tool":
+            continue
+        content = str(message.get("content") or "")
+        if content == ELIDED:
+            continue
+        total -= encoding.estimate_tokens(content) - encoding.estimate_tokens(ELIDED)
+        message["content"] = ELIDED
+        elided += 1
+    return elided
 
 
 def pick_model(cfg: Config, tier: str) -> tuple[str, int]:
@@ -92,7 +140,7 @@ async def run_task(
         outcome.reason = str(exc)
 
     if not read_only and belt.touched and not outcome.escalated:
-        verdict = gate_mod.run(cfg, sorted(belt.touched))
+        verdict = await asyncio.to_thread(gate_mod.run, cfg, sorted(belt.touched))
         outcome.gate_summary = verdict.summary()
         if not verdict.ok:
             outcome.gate_failures = verdict.failures()
@@ -108,7 +156,7 @@ async def run_task(
                 outcome = await _loop(
                     client, cfg, belt, messages, model, num_ctx, tools, outcome, strings
                 )
-                verdict = gate_mod.run(cfg, sorted(belt.touched))
+                verdict = await asyncio.to_thread(gate_mod.run, cfg, sorted(belt.touched))
                 outcome.gate_summary = verdict.summary()
                 outcome.gate_failures = verdict.failures()
 
@@ -139,7 +187,7 @@ async def run_task(
         )
         outcome = await _loop(client, cfg, belt, messages, model, num_ctx, tools, outcome, strings)
         if belt.touched and not outcome.escalated:
-            verdict = gate_mod.run(cfg, sorted(belt.touched))
+            verdict = await asyncio.to_thread(gate_mod.run, cfg, sorted(belt.touched))
             outcome.gate_summary = verdict.summary()
             if verdict.ok and outcome.finished:
                 outcome.ok = True
@@ -185,6 +233,7 @@ async def run_task(
             local_completion_tokens=outcome.local_completion_tokens,
             local_chars_consumed=outcome.local_chars_consumed,
             local_tokens_estimated=outcome.local_tokens_estimated,
+            elided_results=outcome.elided_results,
             receipt_chars=len(outcome.answer) + len(outcome.reason) + 200,
             # ~50 tokens covers the fixed scaffolding of a receipt: the header,
             # the diffstat lines and the gate summary.
@@ -224,6 +273,7 @@ async def _loop(
     clarified = False
     for _ in range(cfg.limits.max_iterations):
         outcome.iterations += 1
+        outcome.elided_results += _fit_context(messages, tools, num_ctx)
         result: ChatResult = await client.chat(
             model=model,
             messages=messages,
@@ -261,7 +311,10 @@ async def _loop(
                         str(args.get("summary") or "").strip(),
                         strings,
                     )
-                tool_result = belt.run(name, args)
+                # to_thread: the belt reads files and can shell out to ripgrep
+                # for up to a minute. Run inline it blocks the stdio server's
+                # event loop, and Claude issues tool calls in parallel.
+                tool_result = await asyncio.to_thread(belt.run, name, args)
                 outcome.local_chars_consumed += len(tool_result)
                 outcome.local_tokens_estimated += encoding.estimate_tokens(tool_result)
                 messages.append({"role": "tool", "name": name, "content": tool_result})

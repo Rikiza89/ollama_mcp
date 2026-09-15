@@ -13,6 +13,7 @@ Design constraints that shape everything here:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import sys
@@ -163,7 +164,9 @@ async def local_verify(workspace_root: str, triage: bool = True) -> str:
         PASS, or a short list of what failed and where.
     """
     cfg = _load(workspace_root)
-    verdict = gate_mod.run(cfg, touched=[])
+    # to_thread: the gate shells out for up to `timeout_s` (180s by default),
+    # which would otherwise stall every other request on this stdio server.
+    verdict = await asyncio.to_thread(gate_mod.run, cfg, [])
     strings = i18n.strings(i18n.resolve(cfg.i18n.language))
     if verdict.skipped:
         return strings.no_gate_configured.format(path=cfg.workspace / config.CONFIG_NAME)

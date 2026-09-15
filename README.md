@@ -129,9 +129,18 @@ deny = [".git", ".env", "node_modules", ".venv", ".pem"]
 language = "auto"   # "auto" | "en" | "ja"
 ```
 
-The config file is validated when it loads: an unknown key or a value of the
-wrong type stops the server with the file and the key named, rather than
-silently falling back to a default three delegations later.
+The config file is validated when it loads: an unknown key, a value of the
+wrong type, or a malformed `commands` entry stops the server with the file and
+the key named, rather than silently falling back to a default three delegations
+later. `commands` in particular is a list of *argv lists* — `[["ruff", "check",
+"."]]`, not `["ruff check ."]` — and the flat spelling is rejected rather than
+quietly run one character at a time.
+
+A gate command that cannot be executed at all — a typo, or a tool missing from
+the PATH the MCP server was launched with, which is often not the PATH your
+shell has — is reported as `UNVERIFIED` and **fails** the gate. A check that did
+not run has not passed, and the gate is the whole basis for trusting a delegated
+edit.
 
 With no config file, the gate falls back to syntax checks on touched files plus an autodetected project check (`ruff`, `tsc --noEmit`, `cargo check`, `go build`).
 
@@ -208,18 +217,24 @@ Note on `num_ctx`: Ollama defaults to 4096 and **truncates silently** past it. T
 The local model writes to your real working tree. Guards, in order:
 
 1. Every path is resolved and confined to `workspace_root`; traversal is rejected.
-2. `[sandbox] deny` blocks `.git`, `.env`, keys, `node_modules`, and anything else you list.
+2. `[sandbox] deny` blocks `.git`, `.env`, keys, `node_modules`, and anything else you list. One rule set governs every route to a file's contents — `read_file`, `grep` and `list_files` alike — so search cannot return what `read_file` refuses to open.
 3. Original file contents are snapshotted in memory before the first write and restored automatically if the gate fails.
 4. `local_explain` and `local_verify` run with no write tools at all.
 5. Edits preserve each file's existing line endings and byte content — no whole-file CRLF churn, and non-ASCII comments (Japanese, accented text) survive a non-UTF-8 console, a BOM, or a legacy Shift-JIS encoding.
 
+6. The local model's transcript is held to a fraction of `num_ctx`, with the oldest tool results dropped when it would overflow. Ollama truncates an over-long prompt silently, and a model that edits a file it only half saw is the failure this design most needs not to have.
+
 Run it in a git repository anyway. In-memory rollback covers gate failures; it does not cover a model that succeeded at the wrong thing.
+
+### `.ollama-mcp.toml` is executable configuration
+
+`[gate] commands` are commands this server runs in your working tree. A repository you clone carries its own, so `local_verify` — and the gate that follows every `local_edit` — will run whatever that file says. This is the same trust model as `.vscode/tasks.json` or a Makefile, and it deserves the same habit: read a new repository's `.ollama-mcp.toml` before delegating into it.
 
 ## Development
 
 ```bash
 uv pip install -e ".[dev]"
-pytest          # 143 tests against a fake Ollama fixture — no GPU, no models needed
+pytest          # 173 tests against a fake Ollama fixture — no GPU, no models needed
 ruff check .
 ```
 

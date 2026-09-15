@@ -20,7 +20,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import encoding
+from . import config, encoding
 from .config import Config
 
 MAX_OUTPUT_CHARS = 1500
@@ -31,6 +31,16 @@ class Check:
     name: str
     ok: bool
     output: str = ""
+    # False when the command could not be executed at all. Kept apart from a
+    # plain failure so the receipt can say "your gate is broken" rather than
+    # "your code is broken" -- but it is still not a pass. See `_run_command`.
+    ran: bool = True
+
+    @property
+    def verdict(self) -> str:
+        if self.ok:
+            return "pass"
+        return "FAIL" if self.ran else "UNVERIFIED"
 
 
 @dataclass
@@ -42,7 +52,7 @@ class GateResult:
     def summary(self) -> str:
         if self.skipped:
             return "no gate configured"
-        return ", ".join(f"{c.name}={'pass' if c.ok else 'FAIL'}" for c in self.checks)
+        return ", ".join(f"{c.name}={c.verdict}" for c in self.checks)
 
     def failures(self) -> str:
         return "\n\n".join(f"[{c.name}]\n{c.output}".strip() for c in self.checks if not c.ok)
@@ -127,8 +137,28 @@ def autodetect(cfg: Config) -> list[list[str]]:
     return commands
 
 
+def _resolve_executable(cfg: Config, program: str) -> str:
+    """Resolve a workspace-relative interpreter or script path.
+
+    On Windows `CreateProcess` looks the executable up against the *parent
+    process's* directory, not the `cwd=` it is handed (POSIX gets this right:
+    CPython chdirs in the child before exec). So a natural gate command like
+    `["./.venv/bin/python", "-m", "pytest"]` or `["python-embed/python.exe", ...]`
+    would fail with FileNotFoundError even though the file is right there in the
+    project. Bare names (`ruff`, `npm`) are left alone for PATH lookup.
+    """
+    if "/" not in program and "\\" not in program:
+        return program
+    candidate = Path(program)
+    if candidate.is_absolute():
+        return program
+    resolved = (cfg.workspace / candidate).resolve()
+    return str(resolved) if resolved.is_file() else program
+
+
 def _run_command(cfg: Config, cmd: list[str]) -> Check:
     name = " ".join(cmd[:3])
+    cmd = [_resolve_executable(cfg, cmd[0]), *cmd[1:]]
     try:
         # Bytes, not text=True. `text=True` decodes with the locale encoding,
         # which is cp932 on a Japanese Windows install; ruff, pytest and tsc all
@@ -144,7 +174,20 @@ def _run_command(cfg: Config, cmd: list[str]) -> Check:
             check=False,
         )
     except FileNotFoundError:
-        return Check(name, True, f"skipped: {cmd[0]} not installed")
+        # NOT a pass. This used to return ok=True, so a typo in `commands`, or an
+        # MCP server launched with a PATH that lacks the tool -- the normal case,
+        # since the server is spawned from the desktop app's environment and not
+        # from your shell -- turned the gate into a no-op that still reported
+        # `gate: pass`. The gate is the whole basis for trusting a delegated
+        # edit; a check that did not run has not passed.
+        return Check(
+            name,
+            False,
+            f"{cmd[0]} could not be run (not installed, or not on this server's "
+            f"PATH), so this check verified nothing. Fix the command in "
+            f"{config.CONFIG_NAME}, or remove it.",
+            ran=False,
+        )
     except subprocess.TimeoutExpired:
         return Check(name, False, f"timed out after {cfg.gate.timeout_s}s")
     except OSError as exc:

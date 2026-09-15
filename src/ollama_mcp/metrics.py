@@ -26,6 +26,12 @@ from .config import Config
 
 CHARS_PER_TOKEN = 4.0
 
+# The log is append-only bookkeeping, read back only as a recent-history summary,
+# so it is capped rather than kept forever: `local_status` used to read the whole
+# file on every call, and nothing ever trimmed it.
+MAX_LOG_BYTES = 4 * 1024 * 1024
+TAIL_BYTES = 1024 * 1024
+
 
 @dataclass
 class Record:
@@ -41,6 +47,7 @@ class Record:
     receipt_chars: int
     local_tokens_estimated: int = 0
     receipt_tokens_estimated: int = 0
+    elided_results: int = 0
     gate: str = ""
     ts: float = field(default_factory=time.time)
 
@@ -54,6 +61,7 @@ class Record:
 def append(cfg: Config, record: Record) -> None:
     try:
         cfg.state_dir.mkdir(parents=True, exist_ok=True)
+        _rotate(cfg.state_dir / "metrics.jsonl")
         row = asdict(record)
         row["tokens_avoided_estimate"] = record.tokens_avoided
         with (cfg.state_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
@@ -98,6 +106,23 @@ def _receipt_tokens(row: dict[str, Any]) -> int:
     return estimated or int((row.get("receipt_chars") or 0) / CHARS_PER_TOKEN)
 
 
+def _rotate(path: Path) -> None:
+    """Keep one previous generation, so the log cannot grow without bound."""
+    if path.is_file() and path.stat().st_size > MAX_LOG_BYTES:
+        path.replace(path.with_suffix(".jsonl.1"))
+
+
 def _tail(path: Path, limit: int) -> list[str]:
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    return lines[-limit:]
+    """Read back only the end of the log, not all of it.
+
+    `local_status` is advertised as cheap, and it is called at the start of a
+    session; pulling a multi-megabyte log through `read_text` to look at the
+    last 500 rows is not.
+    """
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        if size > TAIL_BYTES:
+            handle.seek(size - TAIL_BYTES)
+            handle.readline()  # discard the row the seek landed inside
+        raw = handle.read()
+    return raw.decode("utf-8", errors="replace").splitlines()[-limit:]

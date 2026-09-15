@@ -19,7 +19,7 @@ from typing import Any
 
 from . import encoding
 from .config import Config
-from .sandbox import SandboxError, rel, resolve
+from .sandbox import SandboxError, denied_rule, rel, resolve
 
 MAX_TOOL_RESULT_CHARS = 20_000
 # The same budget expressed in tokens, which is what the local model's context
@@ -113,21 +113,25 @@ def schemas() -> list[dict[str, Any]]:
     ]
 
 
-def read_text(path: Path, errors: str = "surrogateescape") -> str:
-    """Read preserving the file's own line endings.
+def read_source(path: Path) -> tuple[str, str]:
+    """Read a file as text plus the codec that decoded it.
 
-    `Path.read_text` applies universal newlines, and `Path.write_text` then
-    re-encodes them to os.linesep. On Windows that silently rewrites every LF
-    file to CRLF, turning a one-line edit into a whole-file diff. Both sides
-    pass newline="" so bytes round-trip unchanged.
+    Binary I/O throughout, so nothing is translated on the way in or out: no
+    universal-newline rewrite (which turned every LF file on Windows into a
+    whole-file CRLF diff) and no encoding upgrade (`write_text` used to emit
+    UTF-8 unconditionally, quietly converting a cp932 source file the task had
+    only asked to add a comment to).
     """
-    with path.open("r", encoding="utf-8", errors=errors, newline="") as handle:
-        return handle.read()
+    return encoding.detect_text(path.read_bytes())
 
 
-def write_text(path: Path, text: str, errors: str = "surrogateescape") -> None:
-    with path.open("w", encoding="utf-8", errors=errors, newline="") as handle:
-        handle.write(text)
+def write_source(path: Path, text: str, codec: str) -> None:
+    """Write `text` back in the codec the file was read with.
+
+    Raises:
+        encoding.UnrepresentableText: if the new text does not fit that codec.
+    """
+    path.write_bytes(encoding.encode_text(text, codec))
 
 
 
@@ -135,9 +139,15 @@ def write_text(path: Path, text: str, errors: str = "surrogateescape") -> None:
 class ToolBelt:
     cfg: Config
     read_only: bool = False
-    originals: dict[Path, str | None] = field(default_factory=dict)
+    # Raw bytes, not decoded text: a rollback has to restore the file exactly as
+    # it was, including its encoding, its BOM and its line endings, and the only
+    # representation that guarantees that is the one that came off the disk.
+    originals: dict[Path, bytes | None] = field(default_factory=dict)
     touched: set[Path] = field(default_factory=set)
     calls: list[str] = field(default_factory=list)
+    # Directories `write_file` had to create, deepest last, so a rollback can
+    # take them back out instead of leaving empty scaffolding behind.
+    created_dirs: list[Path] = field(default_factory=list)
 
     # -- dispatch ---------------------------------------------------------
     def run(self, name: str, args: dict[str, Any]) -> str:
@@ -149,6 +159,8 @@ class ToolBelt:
             return _truncate(handler(**args))
         except SandboxError as exc:
             return f"ERROR: {exc}"
+        except encoding.UnrepresentableText as exc:
+            return f"ERROR: {exc}"
         except TypeError as exc:
             return f"ERROR: bad arguments for {name}: {exc}"
         except Exception as exc:  # noqa: BLE001 - surfaced back to the local model
@@ -158,9 +170,7 @@ class ToolBelt:
     def _snapshot(self, path: Path) -> None:
         if path in self.originals:
             return
-        self.originals[path] = (
-            read_text(path) if path.is_file() else None
-        )
+        self.originals[path] = path.read_bytes() if path.is_file() else None
 
     def rollback(self) -> list[str]:
         restored: list[str] = []
@@ -170,17 +180,43 @@ class ToolBelt:
                     path.unlink()
                     restored.append(rel(self.cfg, path))
             else:
-                write_text(path, original)
+                path.write_bytes(original)
                 restored.append(rel(self.cfg, path))
+        self._remove_created_dirs()
         self.touched.clear()
         return restored
+
+    def _make_parents(self, target: Path) -> None:
+        """Create the parents `write_file` needs, remembering the new ones."""
+        missing: list[Path] = []
+        parent = target.parent
+        while not parent.exists() and self.cfg.workspace in parent.parents:
+            missing.append(parent)
+            parent = parent.parent
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self.created_dirs.extend(reversed(missing))
+
+    def _remove_created_dirs(self) -> None:
+        """Take back directories `write_file` created, deepest first.
+
+        Only ever removes a directory this belt made and that is now empty, so
+        an escalation leaves no trace -- "the working tree is unchanged" should
+        not come with a litter of empty folders.
+        """
+        for directory in sorted(self.created_dirs, reverse=True):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass  # not empty, or already gone: either way, leave it
+        self.created_dirs.clear()
 
     def diffstat(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for path in sorted(self.touched):
             original = self.originals.get(path)
-            new = read_text(path) if path.is_file() else ""
-            added, removed = _line_delta((original or "").splitlines(), new.splitlines())
+            before = encoding.detect_text(original)[0] if original else ""
+            after = read_source(path)[0] if path.is_file() else ""
+            added, removed = _line_delta(before.splitlines(), after.splitlines())
             out.append(
                 {
                     "path": rel(self.cfg, path),
@@ -201,24 +237,37 @@ class ToolBelt:
                 f"ERROR: {rel(self.cfg, target)} is larger than "
                 f"{self.cfg.limits.max_file_bytes} bytes; read a line range instead."
             )
-        lines = read_text(target, errors="replace").splitlines()
+        raw = target.read_bytes()
+        if encoding.looks_binary(raw):
+            return f"ERROR: {rel(self.cfg, target)} looks like a binary file."
+        lines = encoding.detect_text(raw)[0].splitlines()
+        total = len(lines)
+
+        # An out-of-range window used to produce a header reading "lines 99-2 of
+        # 2" and an empty body -- no error, nothing to act on, and a small model
+        # reliably just asks for it again. Say what went wrong instead.
         lo = max(1, start_line or 1)
-        hi = min(len(lines), end_line or len(lines))
+        hi = min(total, end_line or total)
+        if lo > total:
+            return f"ERROR: {rel(self.cfg, target)} has only {total} lines; start_line={lo}."
+        if lo > hi:
+            return f"ERROR: start_line={lo} is after end_line={end_line}."
+
         body = "\n".join(f"{i:>5}  {lines[i - 1]}" for i in range(lo, hi + 1))
-        return f"{rel(self.cfg, target)} (lines {lo}-{hi} of {len(lines)})\n{body}"
+        return f"{rel(self.cfg, target)} (lines {lo}-{hi} of {total})\n{body}"
 
     def _t_edit_file(self, path: str, old_text: str, new_text: str) -> str:
         if self.read_only:
             return "ERROR: this task is read-only; no edits allowed."
         target = resolve(self.cfg, path, must_exist=True)
-        content = read_text(target)
+        content, codec = read_source(target)
         count = content.count(old_text)
         if count == 0:
             return "ERROR: old_text not found. Re-read the file and copy the exact text."
         if count > 1:
             return f"ERROR: old_text appears {count} times; include more surrounding context."
         self._snapshot(target)
-        write_text(target, content.replace(old_text, new_text, 1))
+        write_source(target, content.replace(old_text, new_text, 1), codec)
         self.touched.add(target)
         return f"OK: edited {rel(self.cfg, target)}"
 
@@ -226,9 +275,10 @@ class ToolBelt:
         if self.read_only:
             return "ERROR: this task is read-only; no edits allowed."
         target = resolve(self.cfg, path)
+        codec = read_source(target)[1] if target.is_file() else "utf-8"
         self._snapshot(target)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        write_text(target, content)
+        self._make_parents(target)
+        write_source(target, content, codec)
         self.touched.add(target)
         # byte_length, not len(): a Japanese file is ~3x its character count in
         # UTF-8, and a receipt that says "bytes" should not mean "characters".
@@ -255,18 +305,22 @@ class ToolBelt:
         except re.error as exc:
             return f"ERROR: invalid pattern: {exc}"
 
-        denied = {d.lower() for d in self.cfg.sandbox.deny}
         hits: list[str] = []
         for item in sorted(self.cfg.workspace.rglob(glob or "*")):
-            if not item.is_file():
+            if not item.is_file() or denied_rule(self.cfg, item) is not None:
                 continue
-            parts = {p.lower() for p in item.relative_to(self.cfg.workspace).parts}
-            if parts & denied or item.stat().st_size > self.cfg.limits.max_file_bytes:
+            if item.stat().st_size > self.cfg.limits.max_file_bytes:
                 continue
             try:
-                text = read_text(item, errors="strict")
-            except (UnicodeDecodeError, OSError):
-                continue  # binary or unreadable
+                raw = item.read_bytes()
+            except OSError:
+                continue
+            if encoding.looks_binary(raw):
+                continue
+            # detect_text, not strict UTF-8: the old test quietly excluded every
+            # cp932 source file in the repository from search, as though those
+            # files simply contained no matches.
+            text = encoding.detect_text(raw)[0]
             for number, line in enumerate(text.splitlines(), start=1):
                 if regex.search(line):
                     hits.append(f"{rel(self.cfg, item)}:{number}:{line[:300]}")
@@ -276,13 +330,9 @@ class ToolBelt:
 
     def _t_list_files(self, path: str = ".") -> str:
         root = resolve(self.cfg, path, must_exist=True)
-        denied = {d.lower() for d in self.cfg.sandbox.deny}
         out: list[str] = []
         for item in sorted(root.rglob("*")):
-            if not item.is_file():
-                continue
-            parts = {p.lower() for p in item.relative_to(self.cfg.workspace).parts}
-            if parts & denied:
+            if not item.is_file() or denied_rule(self.cfg, item) is not None:
                 continue
             out.append(rel(self.cfg, item))
             if len(out) >= 400:
@@ -296,6 +346,10 @@ def _ripgrep(cfg: Config, pattern: str, glob: str | None, limit: int) -> list[st
     if not shutil.which("rg"):
         return None
     cmd = ["rg", "--line-number", "--no-heading", "--color", "never", "--smart-case", "-m", "40"]
+    for token in cfg.sandbox.deny:
+        cmd += ["--glob", f"!**/{token}", "--glob", f"!**/{token}/**"]
+        if token.startswith("."):
+            cmd += ["--glob", f"!**/*{token}"]
     if glob:
         cmd += ["--glob", glob]
     cmd += ["-e", pattern, "."]
@@ -314,7 +368,34 @@ def _ripgrep(cfg: Config, pattern: str, glob: str | None, limit: int) -> list[st
         return None
     if proc.returncode not in (0, 1):
         return f"ERROR: search failed: {encoding.decode_output(proc.stderr)[:400]}"
-    return encoding.decode_output(proc.stdout).splitlines()[:limit]
+    return _keep_allowed(cfg, encoding.decode_output(proc.stdout).splitlines())[:limit]
+
+
+def _keep_allowed(cfg: Config, lines: list[str]) -> list[str]:
+    """Drop hits whose path hits a deny rule.
+
+    The --glob exclusions handed to ripgrep should already have kept it away
+    from these files, but the deny list is a guard, and a guard does not stake
+    itself on another program's glob dialect agreeing with ours -- this path
+    used to apply no deny filtering whatever, so with `rg` installed the whole
+    list was unenforced for search. A hit whose path will not parse is dropped
+    as well: failing closed costs at most one missed match, failing open costs
+    a private key.
+    """
+    out: list[str] = []
+    for line in lines:
+        path, separator, _ = line.partition(":")
+        if not separator:
+            continue
+        try:
+            resolved = (cfg.workspace / path).resolve()
+        except OSError:  # pragma: no cover - platform dependent
+            continue
+        if resolved != cfg.workspace and cfg.workspace not in resolved.parents:
+            continue
+        if denied_rule(cfg, resolved) is None:
+            out.append(line)
+    return out
 
 
 def _line_delta(old: list[str], new: list[str]) -> tuple[int, int]:

@@ -145,3 +145,137 @@ def test_grep_is_smart_case(tmp_path: Path) -> None:
     belt = ToolBelt(cfg=config.load(tmp_path))
     assert "FREE_THRESHOLD" in belt.run("grep", {"pattern": "threshold"})
     assert belt.run("grep", {"pattern": "Threshold"}) == "no matches"
+
+
+# --- the deny list governs every route to a file's contents -----------------
+
+
+@pytest.fixture()
+def secrets(tmp_path: Path) -> ToolBelt:
+    (tmp_path / "app.py").write_text("token = FREE\n", encoding="utf-8")
+    (tmp_path / "deploy.pem").write_text("PRIVATE-KEY-BODY\n", encoding="utf-8")
+    (tmp_path / "id_rsa").write_text("PRIVATE-KEY-BODY\n", encoding="utf-8")
+    (tmp_path / "prod.env").write_text("API_KEY=PRIVATE-KEY-BODY\n", encoding="utf-8")
+    return ToolBelt(cfg=config.load(tmp_path))
+
+
+def test_grep_does_not_leak_what_read_file_refuses(secrets: ToolBelt) -> None:
+    """The guard had two implementations and therefore one hole.
+
+    `read_file` consulted the deny list properly; `grep` did its own part-only,
+    lowercased comparison that never looked at extensions, so a key `read_file`
+    would not open came back a line at a time through search.
+    """
+    assert secrets.run("read_file", {"path": "deploy.pem"}).startswith("ERROR:")
+    hits = secrets.run("grep", {"pattern": "PRIVATE-KEY-BODY"})
+    assert "PRIVATE-KEY-BODY" not in hits
+    for denied in ("deploy.pem", "id_rsa", "prod.env"):
+        assert denied not in hits
+
+
+def test_list_files_does_not_name_denied_files(secrets: ToolBelt) -> None:
+    listing = secrets.run("list_files", {})
+    assert "app.py" in listing
+    for denied in ("deploy.pem", "id_rsa", "prod.env"):
+        assert denied not in listing
+
+
+def test_grep_still_finds_ordinary_files(secrets: ToolBelt) -> None:
+    assert "app.py" in secrets.run("grep", {"pattern": "FREE"})
+
+
+# --- line windows ----------------------------------------------------------
+
+
+def test_read_file_rejects_a_window_past_the_end(belt: ToolBelt) -> None:
+    """This used to return a header reading "lines 99-2 of 2" and no error."""
+    out = belt.run("read_file", {"path": "a.py", "start_line": 99})
+    assert out.startswith("ERROR:")
+    assert "only 2 lines" in out
+
+
+def test_read_file_rejects_an_inverted_window(belt: ToolBelt) -> None:
+    out = belt.run("read_file", {"path": "a.py", "start_line": 2, "end_line": 1})
+    assert out.startswith("ERROR:")
+
+
+# --- rollback leaves nothing behind ----------------------------------------
+
+
+def test_rollback_removes_directories_it_created(belt: ToolBelt) -> None:
+    belt.run("write_file", {"path": "new/deep/c.py", "content": "z = 3\n"})
+    assert (belt.cfg.workspace / "new" / "deep").is_dir()
+    belt.rollback()
+    assert not (belt.cfg.workspace / "new").exists()
+
+
+def test_rollback_keeps_directories_that_already_existed(belt: ToolBelt) -> None:
+    (belt.cfg.workspace / "pkg").mkdir()
+    belt.run("write_file", {"path": "pkg/c.py", "content": "z = 3\n"})
+    belt.rollback()
+    assert (belt.cfg.workspace / "pkg").is_dir()
+
+
+# --- what the model is shown is what edit_file matches against ---------------
+
+
+def test_a_legacy_encoded_file_can_actually_be_edited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bug this pair of methods existed to have.
+
+    read_file decoded with errors="replace" and edit_file with surrogateescape,
+    so the model was shown U+FFFD where the Japanese comment was, copied that
+    back verbatim as old_text, and could never match. Every edit to a cp932
+    file escalated after spending the full iteration budget.
+    """
+    monkeypatch.setattr("ollama_mcp.encoding._locale_encoding", lambda: "cp932")
+    source = tmp_path / "s.py"
+    source.write_bytes("# 設定を読み込む\nx = 1\n".encode("cp932"))
+    belt = ToolBelt(cfg=config.load(tmp_path))
+
+    shown = belt.run("read_file", {"path": "s.py"})
+    assert "設定を読み込む" in shown
+    # Exactly what a model copies out of that listing: the gutter is 5 wide
+    # plus two spaces.
+    copied = shown.splitlines()[1][7:]
+    assert belt.run("edit_file", {"path": "s.py", "old_text": copied, "new_text": "# loaded"})
+
+    assert source.read_bytes() == "# loaded\nx = 1\n".encode("cp932")
+
+
+def test_an_edit_never_converts_the_files_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("ollama_mcp.encoding._locale_encoding", lambda: "cp932")
+    source = tmp_path / "s.py"
+    original = "# 設定\nx = 1\n".encode("cp932")
+    source.write_bytes(original)
+    belt = ToolBelt(cfg=config.load(tmp_path))
+
+    out = belt.run("edit_file", {"path": "s.py", "old_text": "x = 1", "new_text": "x = 1  # ✓"})
+    assert out.startswith("ERROR:")
+    assert "cp932" in out
+    # Refused, not silently upgraded to UTF-8 -- which would have rewritten
+    # every byte of a file the task only asked to append a comment to.
+    assert source.read_bytes() == original
+
+
+def test_a_bom_survives_an_edit(tmp_path: Path) -> None:
+    source = tmp_path / "b.py"
+    source.write_bytes("# こんにちは\ny = 1\n".encode("utf-8-sig"))
+    belt = ToolBelt(cfg=config.load(tmp_path))
+
+    belt.run("edit_file", {"path": "b.py", "old_text": "y = 1", "new_text": "y = 2"})
+    assert source.read_bytes() == "# こんにちは\ny = 2\n".encode("utf-8-sig")
+
+
+def test_rollback_restores_bytes_exactly(tmp_path: Path) -> None:
+    source = tmp_path / "c.py"
+    original = "a = 1\r\nb = 2\r\n".encode("utf-8-sig")
+    source.write_bytes(original)
+    belt = ToolBelt(cfg=config.load(tmp_path))
+
+    belt.run("edit_file", {"path": "c.py", "old_text": "b = 2", "new_text": "b = 22"})
+    belt.rollback()
+    assert source.read_bytes() == original

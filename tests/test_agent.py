@@ -197,3 +197,76 @@ def test_pick_model_respects_tier(tmp_path: Path, tier: str, expected: str) -> N
     name, num_ctx = agent.pick_model(cfg, tier)
     assert name == getattr(cfg.models, expected)
     assert num_ctx == getattr(cfg.models, f"{expected}_num_ctx")
+
+
+# --- the transcript gets a budget, not just each result ---------------------
+
+
+def _tool_message(size: int) -> dict:
+    return {"role": "tool", "name": "read_file", "content": "x" * size}
+
+
+def test_a_short_transcript_is_left_alone() -> None:
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        _tool_message(400),
+    ]
+    assert agent._fit_context(messages, [], num_ctx=16384) == 0
+    assert messages[2]["content"] == "x" * 400
+
+
+def test_old_tool_results_are_dropped_to_fit_the_window() -> None:
+    """Capping each result does not cap their sum.
+
+    Twelve iterations of a 5,000-token result is 60,000 tokens going into a
+    16,384-token window, where Ollama truncates silently and the model edits a
+    file it never fully saw.
+    """
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        *[_tool_message(20_000) for _ in range(12)],
+    ]
+    dropped = agent._fit_context(messages, [], num_ctx=16384)
+
+    assert dropped > 0
+    # Oldest first, and the most recent result is the one kept.
+    assert messages[2]["content"] == agent.ELIDED
+    assert messages[-1]["content"] == "x" * 20_000
+    total = sum(len(str(m["content"])) for m in messages)
+    assert total / 4 < 16384
+
+
+def test_the_task_itself_is_never_dropped() -> None:
+    messages = [
+        {"role": "system", "content": "s" * 40_000},
+        {"role": "user", "content": "t" * 40_000},
+        _tool_message(40_000),
+    ]
+    agent._fit_context(messages, [], num_ctx=4096)
+    assert messages[0]["content"] == "s" * 40_000
+    assert messages[1]["content"] == "t" * 40_000
+
+
+def test_fitting_is_idempotent() -> None:
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        *[_tool_message(20_000) for _ in range(12)],
+    ]
+    agent._fit_context(messages, [], num_ctx=16384)
+    assert agent._fit_context(messages, [], num_ctx=16384) == 0
+
+
+def test_tool_schemas_count_against_the_budget() -> None:
+    from ollama_mcp import localtools
+
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        _tool_message(12_000),
+    ]
+    bare = agent._fit_context([dict(m) for m in messages], [], num_ctx=4096)
+    with_tools = agent._fit_context(messages, localtools.schemas(), num_ctx=4096)
+    assert with_tools >= bare
