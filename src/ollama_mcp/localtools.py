@@ -80,9 +80,26 @@ def schemas() -> list[dict[str, Any]]:
         ),
         tool(
             "write_file",
-            "Write a file's full contents, creating it if needed. Use only for new files or "
-            "full rewrites; prefer edit_file otherwise.",
-            {"path": {"type": "string"}, "content": {"type": "string"}},
+            "Write a file. With start_line and end_line, replaces just those lines "
+            "with content -- the best way to rewrite a block of prose or a multi-line "
+            "comment, since nothing has to match exactly. Without them, writes the "
+            "whole file, creating it if needed.",
+            {
+                "path": {"type": "string"},
+                "content": {
+                    "type": "string",
+                    "description": "The new text. With a line range, this replaces "
+                    "exactly those lines, so include every line of the replacement.",
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "Optional, 1-indexed. First line to replace.",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "Optional, 1-indexed inclusive. Last line to replace.",
+                },
+            },
             ["path", "content"],
         ),
         tool(
@@ -360,9 +377,17 @@ class ToolBelt:
         self.touched.add(target)
         return f"OK: edited {rel(self.cfg, target)}"
 
-    def _t_write_file(self, path: str, content: str) -> str:
+    def _t_write_file(
+        self,
+        path: str,
+        content: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> str:
         if self.read_only:
             return "ERROR: this task is read-only; no edits allowed."
+        if start_line is not None or end_line is not None:
+            return self._write_range(path, content, start_line, end_line)
         target = resolve(self.cfg, path)
         codec = "utf-8"
         if target.is_file():
@@ -381,6 +406,40 @@ class ToolBelt:
         # byte_length, not len(): a Japanese file is ~3x its character count in
         # UTF-8, and a receipt that says "bytes" should not mean "characters".
         return f"OK: wrote {rel(self.cfg, target)} ({encoding.byte_length(content)} bytes)"
+
+    def _write_range(
+        self, path: str, content: str, start_line: int | None, end_line: int | None
+    ) -> str:
+        """Replace a line range outright.
+
+        Translation is the case that needs this. `edit_file` has to match text
+        exactly, and a model cannot reproduce a multi-line block from
+        `read_file`'s numbered output -- watching one work, every multi-line
+        `old_text` failed and it retried each a few times before giving up. A
+        line range has nothing to match: the model already knows the numbers,
+        because it just read them.
+        """
+        target = resolve(self.cfg, path, must_exist=True)
+        existing, codec = read_source(target)
+        lines = existing.splitlines(keepends=True)
+        lo = max(1, start_line or 1)
+        hi = min(len(lines), end_line or len(lines))
+        if lo > len(lines):
+            return f"ERROR: {rel(self.cfg, target)} has only {len(lines)} lines; start_line={lo}."
+        if lo > hi:
+            return f"ERROR: start_line={lo} is after end_line={end_line}."
+
+        newline = dominant_newline(existing)
+        block = to_newline(content, newline)
+        # The replaced range ended in a line break unless it ran to a final
+        # line that had none; keep the file's shape either way.
+        if not block.endswith(newline) and lines[hi - 1].endswith(("\n", "\r")):
+            block += newline
+
+        self._snapshot(target)
+        write_source(target, "".join(lines[: lo - 1]) + block + "".join(lines[hi:]), codec)
+        self.touched.add(target)
+        return f"OK: replaced lines {lo}-{hi} of {rel(self.cfg, target)}"
 
     def _t_grep(self, pattern: str, glob: str | None = None, max_results: int = 80) -> str:
         limit = max(1, max_results)

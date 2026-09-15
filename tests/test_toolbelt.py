@@ -385,3 +385,73 @@ def test_near_line_is_coerced_from_the_text_channel(repeated: ToolBelt) -> None:
         {"path": "page.html", "old_text": "Scegli", "new_text": "Pick", "near_line": "4"},
     )
     assert out.startswith("OK:")
+
+
+# --- replacing a line range -------------------------------------------------
+
+
+@pytest.fixture()
+def block(tmp_path: Path) -> ToolBelt:
+    (tmp_path / "t.css").write_bytes(
+        b"body { margin: 0; }\r\n/* prima riga\r\n   seconda riga\r\n   terza riga */\r\np { color: red; }\r\n"
+    )
+    return ToolBelt(cfg=config.load(tmp_path))
+
+
+def test_write_file_replaces_a_line_range(block: ToolBelt) -> None:
+    """The case edit_file cannot serve: a multi-line comment.
+
+    A model cannot reproduce a multi-line block from read_file's numbered
+    output, so exact matching always failed. A line range has nothing to match.
+    """
+    out = block.run(
+        "write_file",
+        {"path": "t.css", "content": "/* first line\n   second line\n   third line */",
+         "start_line": 2, "end_line": 4},
+    )
+    assert out.startswith("OK: replaced lines 2-4")
+    raw = (block.cfg.workspace / "t.css").read_bytes()
+    assert raw == (
+        b"body { margin: 0; }\r\n/* first line\r\n   second line\r\n   third line */\r\n"
+        b"p { color: red; }\r\n"
+    )
+
+
+def test_a_range_write_keeps_the_files_line_endings(block: ToolBelt) -> None:
+    block.run("write_file", {"path": "t.css", "content": "/* x */", "start_line": 2, "end_line": 4})
+    raw = (block.cfg.workspace / "t.css").read_bytes()
+    assert b"\n" not in raw.replace(b"\r\n", b"")
+
+
+def test_a_range_write_is_rolled_back_like_any_other(block: ToolBelt) -> None:
+    original = (block.cfg.workspace / "t.css").read_bytes()
+    block.run("write_file", {"path": "t.css", "content": "/* x */", "start_line": 2, "end_line": 4})
+    block.rollback()
+    assert (block.cfg.workspace / "t.css").read_bytes() == original
+
+
+def test_a_range_past_the_end_is_refused(block: ToolBelt) -> None:
+    out = block.run("write_file", {"path": "t.css", "content": "x", "start_line": 99})
+    assert out.startswith("ERROR:")
+    assert "only 5 lines" in out
+
+
+def test_an_inverted_range_is_refused(block: ToolBelt) -> None:
+    out = block.run(
+        "write_file", {"path": "t.css", "content": "x", "start_line": 4, "end_line": 2}
+    )
+    assert out.startswith("ERROR:")
+
+
+def test_a_whole_file_write_still_works(block: ToolBelt) -> None:
+    out = block.run("write_file", {"path": "new.css", "content": "a { b: c; }\n"})
+    assert out.startswith("OK: wrote")
+    assert (block.cfg.workspace / "new.css").read_bytes() == b"a { b: c; }\n"
+
+
+def test_range_arguments_are_coerced_from_the_text_channel(block: ToolBelt) -> None:
+    out = block.run(
+        "write_file",
+        {"path": "t.css", "content": "/* x */", "start_line": "2", "end_line": "4"},
+    )
+    assert out.startswith("OK: replaced lines 2-4")
