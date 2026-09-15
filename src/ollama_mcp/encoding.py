@@ -69,6 +69,103 @@ def _candidate_encodings() -> tuple[str, ...]:
     return tuple(n for n in names if not (n.lower() in seen or seen.add(n.lower())))
 
 
+def detect_text(raw: bytes) -> tuple[str, str]:
+    """Decode source bytes losslessly, returning the text and the codec used.
+
+    Everything the local model is *shown* and everything it *matches against*
+    has to be the same string, or `edit_file` can never succeed: `read_file`
+    used to decode with `errors="replace"`, so a cp932 source file reached the
+    model as U+FFFD, and the `old_text` it copied back verbatim then failed to
+    match the surrogateescape-decoded content on disk. The task burned its whole
+    iteration budget before escalating.
+
+    So: one decode, and one that round-trips. UTF-8 first (with the BOM spelling
+    kept, so writing the file back restores it), then the machine's own
+    encoding -- cp932 on a Japanese Windows install, where a legacy Shift-JIS
+    source file is an ordinary thing to find -- and finally latin-1, which is a
+    bijection over all 256 byte values and therefore cannot fail. The last case
+    shows the model mojibake, but the bytes it does not touch survive the edit
+    unchanged, which is the property that actually matters.
+    """
+    if raw.startswith(UTF8_BOM):
+        return raw[len(UTF8_BOM) :].decode("utf-8"), "utf-8-sig"
+    for name in _source_encodings():
+        try:
+            return raw.decode(name), name
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("latin-1"), "latin-1"
+
+
+def _source_encodings() -> tuple[str, ...]:
+    """UTF-8, then whatever legacy encoding this machine's source files use.
+
+    `getpreferredencoding` is not enough on its own: under UTF-8 mode (a
+    `PYTHONUTF8=1` environment, or `python -X utf8`) it answers "utf-8" and
+    hides the fact that the machine's own codepage is cp932 -- so a Shift-JIS
+    source file fell through to the latin-1 floor and reached the model as
+    mojibake. `locale.getencoding()` reports the real codepage regardless of
+    UTF-8 mode; `getlocale()` supplies the same number on the versions that
+    predate it.
+    """
+    names = ["utf-8"]
+    for guess in (_locale_encoding(), _locale_codepage()):
+        if guess and guess.lower().replace("-", "") not in {"utf8", "ascii", "ansix341968"}:
+            names.append(guess)
+    seen: set[str] = set()
+    return tuple(n for n in names if not (n.lower() in seen or seen.add(n.lower())))
+
+
+def _locale_encoding() -> str:
+    # locale.getencoding() is 3.11+; it is the one that ignores UTF-8 mode.
+    getencoding = getattr(locale, "getencoding", None)
+    if getencoding is not None:
+        return getencoding()
+    return locale.getpreferredencoding(False)
+
+
+def _locale_codepage() -> str:
+    """The locale's codepage as a codec name, e.g. ('Japanese_Japan', '932') -> cp932."""
+    try:
+        number = (locale.getlocale()[1] or "").strip()
+    except ValueError:  # pragma: no cover - malformed platform locale
+        return ""
+    return f"cp{number}" if number.isdigit() else number
+
+
+class UnrepresentableText(ValueError):
+    """The edited text cannot be written back in the file's own encoding."""
+
+
+def encode_text(text: str, codec: str) -> bytes:
+    """Re-encode with the codec `detect_text` reported, never silently upgrading.
+
+    Converting the file to UTF-8 because the new text does not fit its existing
+    encoding would rewrite every byte of a file the task never asked to touch --
+    the system prompt tells the model in as many words not to do that. So a
+    character the file's encoding cannot hold is an error handed back to the
+    model, which escalates, rather than a conversion nobody asked for.
+    """
+    try:
+        return text.encode(codec)
+    except UnicodeEncodeError as exc:
+        raise UnrepresentableText(
+            f"the text contains characters that {codec} cannot represent "
+            f"({exc.object[exc.start : exc.end]!r}); this file is {codec}-encoded "
+            f"and must stay that way"
+        ) from exc
+
+
+def looks_binary(raw: bytes) -> bool:
+    """A NUL byte in the first block. The usual heuristic, and the right one here.
+
+    The previous test was "does this decode as strict UTF-8" -- which on a
+    Japanese machine excluded every cp932 source file in the repository from
+    `grep`, quietly, as though those files held no matches.
+    """
+    return b"\0" in raw[:8192]
+
+
 def strip_bom(raw: bytes) -> bytes:
     """Drop a leading UTF-8 BOM.
 

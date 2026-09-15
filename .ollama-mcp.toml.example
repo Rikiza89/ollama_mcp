@@ -4,6 +4,12 @@
 [gate]
 # Run in the workspace root after every delegated edit. Non-zero exit = failure,
 # which rolls the edit back and escalates to Claude. Keep these FAST.
+#
+# A list of ARGV LISTS -- [["ruff", "check", "."]], never ["ruff check ."].
+# The flat spelling is rejected at load time rather than run one character at
+# a time. A command that cannot be executed at all (typo, or missing from the
+# PATH this server was launched with) fails the gate: a check that did not run
+# has not passed.
 commands = [
   ["ruff", "check", "--quiet", "."],
 ]

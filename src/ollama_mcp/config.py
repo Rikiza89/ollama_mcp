@@ -171,6 +171,8 @@ def load(workspace: str | Path) -> Config:
             cfg.ollama_host = _normalize_host(data["ollama_host"])
         cfg.source = str(path)
 
+    _validate_gate_commands(cfg.gate, source=cfg.source)
+
     # Env always wins, so a user can retarget models without touching the repo.
     cfg.models.fast = os.environ.get("OLLAMA_MCP_FAST_MODEL", cfg.models.fast)
     cfg.models.deep = os.environ.get("OLLAMA_MCP_DEEP_MODEL", cfg.models.deep)
@@ -181,6 +183,34 @@ def load(workspace: str | Path) -> Config:
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"{cfg.source}: [i18n] {exc}") from exc
     return cfg
+
+
+def _validate_gate_commands(gate: Gate, *, source: str) -> None:
+    """Check that `commands` really is a list of argv lists.
+
+    `_merge` only sees `type(value) is list` and waves the whole table through,
+    which let the obvious TOML mistake -- `commands = ["ruff check ."]`, a list
+    of *strings* -- load without complaint. `_run_command` then iterated the
+    string one character at a time, reported the gate as `r u f=pass`, and every
+    delegated edit afterwards was applied against a gate that checked nothing.
+
+    The gate is the one section the documentation says actually matters, so it
+    is worth being strict about, and worth naming the fix in the message.
+    """
+    for index, command in enumerate(gate.commands):
+        where = f"{source}: [gate] commands[{index}]"
+        if not isinstance(command, list):
+            raise ConfigError(
+                f"{where} must be a list of arguments, got {type(command).__name__}. "
+                f'Write [["ruff", "check", "."]], not ["ruff check ."].'
+            )
+        if not command:
+            raise ConfigError(f"{where} is empty; a command needs at least a program name")
+        bad = next((arg for arg in command if type(arg) is not str), None)
+        if bad is not None:
+            raise ConfigError(
+                f"{where} must contain only strings, got {type(bad).__name__}: {bad!r}"
+            )
 
 
 def _normalize_host(host: str) -> str:

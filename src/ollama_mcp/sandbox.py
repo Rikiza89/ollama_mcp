@@ -38,20 +38,44 @@ def resolve(cfg: Config, raw: str, *, must_exist: bool = False) -> Path:
     # spellings of a path already inside the workspace.
     resolved = _normalized_variant(root, resolved)
 
-    rel_parts = resolved.relative_to(root).parts
-    for token in cfg.sandbox.deny:
-        tok = _fold(token)
-        # Extension-style rule (".pem") or dotted dir/file name (".env").
-        if tok.startswith(".") and (
-            _fold(resolved.name) == tok or _fold(resolved.suffix) == tok
-        ):
-            raise SandboxError(f"denied by sandbox rule {token!r}: {raw}")
-        if any(_fold(part) == tok for part in rel_parts):
-            raise SandboxError(f"denied by sandbox rule {token!r}: {raw}")
+    rule = denied_rule(cfg, resolved)
+    if rule is not None:
+        raise SandboxError(f"denied by sandbox rule {rule!r}: {raw}")
 
     if must_exist and not resolved.exists():
         raise SandboxError(f"no such file: {raw}")
     return resolved
+
+
+def denied_rule(cfg: Config, resolved: Path) -> str | None:
+    """The first deny rule `resolved` hits, or None if it hits none.
+
+    Public, and the *only* implementation of the rule, because the search tools
+    used to carry their own: a part-only, `str.lower()` comparison that never
+    looked at extensions. So `read_file("deploy.pem")` was refused while
+    `grep` handed the same key back a line at a time, and `list_files` named it.
+    A guard with two implementations is a guard with one hole.
+
+    `resolved` is expected to be inside the workspace; anything outside it is
+    not this function's business (`resolve` rejects it first) and returns None.
+    """
+    try:
+        parts = resolved.relative_to(cfg.workspace).parts
+    except ValueError:
+        return None
+
+    for token in cfg.sandbox.deny:
+        tok = _fold(token)
+        for part in parts:
+            folded = _fold(part)
+            if folded == tok:
+                return token
+            # Extension-style rule (".pem", ".env"): any component ending in it.
+            # Checked on every component, not just the last, so a file tucked
+            # under a denied directory is denied along with it.
+            if tok.startswith(".") and folded.endswith(tok):
+                return token
+    return None
 
 
 def _fold(text: str) -> str:
