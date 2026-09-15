@@ -58,12 +58,23 @@ def schemas() -> list[dict[str, Any]]:
         ),
         tool(
             "edit_file",
-            "Replace an exact substring in a file. old_text must appear exactly once. "
-            "This is the preferred way to change code.",
+            "Replace an exact substring in a file. Prefer a SHORT fragment from a "
+            "single line, copied exactly. If that fragment appears more than once, "
+            "pass near_line to say which one you mean. This is the preferred way "
+            "to change code.",
             {
                 "path": {"type": "string"},
-                "old_text": {"type": "string", "description": "Exact text to replace."},
+                "old_text": {
+                    "type": "string",
+                    "description": "Exact text to replace. Keep it short and on one "
+                    "line; the line numbers read_file shows are not part of the file.",
+                },
                 "new_text": {"type": "string", "description": "Replacement text."},
+                "near_line": {
+                    "type": "integer",
+                    "description": "Optional. When old_text occurs several times, the "
+                    "line number of the one you mean, as shown by read_file.",
+                },
             },
             ["path", "old_text", "new_text"],
         ),
@@ -305,16 +316,42 @@ class ToolBelt:
         body = "\n".join(f"{i:>5}  {lines[i - 1]}" for i in range(lo, hi + 1))
         return f"{rel(self.cfg, target)} (lines {lo}-{hi} of {total})\n{body}"
 
-    def _t_edit_file(self, path: str, old_text: str, new_text: str) -> str:
+    def _t_edit_file(
+        self, path: str, old_text: str, new_text: str, near_line: int | None = None
+    ) -> str:
         if self.read_only:
             return "ERROR: this task is read-only; no edits allowed."
         target = resolve(self.cfg, path, must_exist=True)
         content, codec = read_source(target)
         count = content.count(old_text)
         if count == 0:
-            return "ERROR: old_text not found. Re-read the file and copy the exact text."
+            # The message is the model's only feedback channel, so it names the
+            # actual cause. Watching a 30B work, every failed edit was a
+            # multi-line block reassembled from read_file's numbered output --
+            # and it would then retry the very same string two or three times.
+            return (
+                "ERROR: old_text not found. The line numbers read_file shows are NOT "
+                "part of the file, so a whole line copied from that output will not "
+                "match. Use a SHORT fragment from a single line instead -- for "
+                "Japanese text, just the Japanese characters themselves, with no "
+                "quotes, indentation or line numbers. Do not retry the same old_text."
+            )
         if count > 1:
-            return f"ERROR: old_text appears {count} times; include more surrounding context."
+            if near_line is None:
+                return (
+                    f"ERROR: old_text appears {count} times. Do not add surrounding "
+                    f"lines -- call edit_file again with the same old_text plus "
+                    f"near_line=<the line number read_file showed for the one you mean>."
+                )
+            offset = _nth_near(content, old_text, near_line)
+            if offset is None:
+                return f"ERROR: no occurrence of old_text near line {near_line}."
+            self._snapshot(target)
+            new_text = to_newline(new_text, dominant_newline(content))
+            edited = content[:offset] + new_text + content[offset + len(old_text) :]
+            write_source(target, edited, codec)
+            self.touched.add(target)
+            return f"OK: edited {rel(self.cfg, target)} near line {near_line}"
         self._snapshot(target)
         # Same reason: a model writing a multi-line replacement types LF even
         # when every other line in the file ends CRLF.
@@ -457,6 +494,19 @@ def _keep_allowed(cfg: Config, lines: list[str]) -> list[str]:
         if denied_rule(cfg, resolved) is None:
             out.append(line)
     return out
+
+
+def _nth_near(content: str, needle: str, near_line: int) -> int | None:
+    """Offset of the occurrence of `needle` whose line is closest to `near_line`."""
+    best: tuple[int, int] | None = None
+    start = 0
+    while (found := content.find(needle, start)) != -1:
+        line = content.count(chr(10), 0, found) + 1
+        distance = abs(line - near_line)
+        if best is None or distance < best[0]:
+            best = (distance, found)
+        start = found + 1
+    return None if best is None else best[1]
 
 
 def _line_delta(old: list[str], new: list[str]) -> tuple[int, int]:

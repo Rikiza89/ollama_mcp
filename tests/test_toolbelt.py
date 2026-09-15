@@ -325,3 +325,63 @@ def test_edit_file_matches_the_replacement_to_the_file(tmp_path: Path) -> None:
     raw = source.read_bytes()
     assert raw == b"a = 1\r\nb = 20\r\nbb = 21\r\nc = 3\r\n"
     assert b"\n" not in raw.replace(b"\r\n", b"")
+
+
+# --- disambiguating a repeated fragment -------------------------------------
+
+
+@pytest.fixture()
+def repeated(tmp_path: Path) -> ToolBelt:
+    # "Scegli" on lines 1 and 4, with filler between.
+    (tmp_path / "page.html").write_text(
+        "<option>Scegli</option>\n<p>filler</p>\n<p>filler</p>\n<option>Scegli</option>\n",
+        encoding="utf-8",
+    )
+    return ToolBelt(cfg=config.load(tmp_path))
+
+
+def test_a_repeated_fragment_asks_for_near_line(repeated: ToolBelt) -> None:
+    """The old advice -- add surrounding context -- is advice a small model
+    cannot follow, because the surrounding context has to be reassembled from
+    read_file's numbered output. Point it at something it already knows."""
+    out = repeated.run("edit_file", {"path": "page.html", "old_text": "Scegli", "new_text": "Pick"})
+    assert out.startswith("ERROR:")
+    assert "appears 2 times" in out
+    assert "near_line" in out
+
+
+def test_near_line_picks_the_intended_occurrence(repeated: ToolBelt) -> None:
+    out = repeated.run(
+        "edit_file",
+        {"path": "page.html", "old_text": "Scegli", "new_text": "Pick", "near_line": 4},
+    )
+    assert out.startswith("OK:")
+    lines = (repeated.cfg.workspace / "page.html").read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "<option>Scegli</option>"   # untouched
+    assert lines[3] == "<option>Pick</option>"     # the one asked for
+
+
+def test_near_line_picks_the_first_when_that_is_closest(repeated: ToolBelt) -> None:
+    repeated.run(
+        "edit_file",
+        {"path": "page.html", "old_text": "Scegli", "new_text": "Pick", "near_line": 1},
+    )
+    lines = (repeated.cfg.workspace / "page.html").read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "<option>Pick</option>"
+    assert lines[3] == "<option>Scegli</option>"
+
+
+def test_a_missing_fragment_explains_the_gutter(belt: ToolBelt) -> None:
+    out = belt.run("edit_file", {"path": "a.py", "old_text": "    1  def f():", "new_text": "x"})
+    assert out.startswith("ERROR:")
+    assert "NOT part of the file" in out
+    assert "Do not retry the same old_text" in out
+
+
+def test_near_line_is_coerced_from_the_text_channel(repeated: ToolBelt) -> None:
+    """Recovered XML tool calls deliver every argument as a string."""
+    out = repeated.run(
+        "edit_file",
+        {"path": "page.html", "old_text": "Scegli", "new_text": "Pick", "near_line": "4"},
+    )
+    assert out.startswith("OK:")
