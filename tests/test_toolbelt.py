@@ -279,3 +279,49 @@ def test_rollback_restores_bytes_exactly(tmp_path: Path) -> None:
     belt.run("edit_file", {"path": "c.py", "old_text": "b = 2", "new_text": "b = 22"})
     belt.rollback()
     assert source.read_bytes() == original
+
+
+# --- a full rewrite must not change the file's line endings ------------------
+
+
+def test_write_file_keeps_crlf_endings(tmp_path: Path) -> None:
+    """The documented guarantee was only half true.
+
+    edit_file preserved a file's line endings; write_file wrote whatever the
+    model produced, and a model emits LF. Flipping a CRLF file wholesale is a
+    whole-file diff for a one-line change, and .gitattributes pins real paths
+    to specific endings (`*.html -text`, `*.bat eol=crlf`).
+    """
+    source = tmp_path / "t.html"
+    source.write_bytes(b"<p>uno</p>\r\n<p>due</p>\r\n")
+    belt = ToolBelt(cfg=config.load(tmp_path))
+
+    belt.run("write_file", {"path": "t.html", "content": "<p>one</p>\n<p>two</p>\n"})
+    assert source.read_bytes() == b"<p>one</p>\r\n<p>two</p>\r\n"
+
+
+def test_write_file_keeps_lf_endings(tmp_path: Path) -> None:
+    source = tmp_path / "t.sh"
+    source.write_bytes(b"echo uno\necho due\n")
+    belt = ToolBelt(cfg=config.load(tmp_path))
+
+    belt.run("write_file", {"path": "t.sh", "content": "echo one\r\necho two\r\n"})
+    assert source.read_bytes() == b"echo one\necho two\n"
+
+
+def test_a_new_file_keeps_what_the_model_wrote(tmp_path: Path) -> None:
+    belt = ToolBelt(cfg=config.load(tmp_path))
+    belt.run("write_file", {"path": "fresh.txt", "content": "a\nb\n"})
+    assert (tmp_path / "fresh.txt").read_bytes() == b"a\nb\n"
+
+
+def test_edit_file_matches_the_replacement_to_the_file(tmp_path: Path) -> None:
+    source = tmp_path / "t.py"
+    source.write_bytes(b"a = 1\r\nb = 2\r\nc = 3\r\n")
+    belt = ToolBelt(cfg=config.load(tmp_path))
+
+    # A multi-line replacement typed with LF, going into a CRLF file.
+    belt.run("edit_file", {"path": "t.py", "old_text": "b = 2", "new_text": "b = 20\nbb = 21"})
+    raw = source.read_bytes()
+    assert raw == b"a = 1\r\nb = 20\r\nbb = 21\r\nc = 3\r\n"
+    assert b"\n" not in raw.replace(b"\r\n", b"")

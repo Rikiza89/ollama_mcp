@@ -125,6 +125,19 @@ def read_source(path: Path) -> tuple[str, str]:
     return encoding.detect_text(path.read_bytes())
 
 
+def dominant_newline(text: str) -> str:
+    """The line ending a file actually uses, measured from its own content."""
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    return "\r\n" if crlf > lf else "\n"
+
+
+def to_newline(text: str, style: str) -> str:
+    """Re-punctuate `text` with one line ending, whatever it arrived with."""
+    body = text.replace("\r\n", "\n")
+    return body.replace("\n", style) if style != "\n" else body
+
+
 def write_source(path: Path, text: str, codec: str) -> None:
     """Write `text` back in the codec the file was read with.
 
@@ -267,6 +280,9 @@ class ToolBelt:
         if count > 1:
             return f"ERROR: old_text appears {count} times; include more surrounding context."
         self._snapshot(target)
+        # Same reason: a model writing a multi-line replacement types LF even
+        # when every other line in the file ends CRLF.
+        new_text = to_newline(new_text, dominant_newline(content))
         write_source(target, content.replace(old_text, new_text, 1), codec)
         self.touched.add(target)
         return f"OK: edited {rel(self.cfg, target)}"
@@ -275,7 +291,16 @@ class ToolBelt:
         if self.read_only:
             return "ERROR: this task is read-only; no edits allowed."
         target = resolve(self.cfg, path)
-        codec = read_source(target)[1] if target.is_file() else "utf-8"
+        codec = "utf-8"
+        if target.is_file():
+            existing, codec = read_source(target)
+            # A model emits LF. Writing that straight back flips a CRLF file
+            # wholesale, which is a whole-file diff for a one-line change and
+            # breaks any path pinned by .gitattributes (`*.html -text`,
+            # `*.bat eol=crlf`). edit_file has always preserved endings; a full
+            # rewrite has to as well, or the documented guarantee is only half
+            # true. A file being created keeps whatever the model wrote.
+            content = to_newline(content, dominant_newline(existing))
         self._snapshot(target)
         self._make_parents(target)
         write_source(target, content, codec)
