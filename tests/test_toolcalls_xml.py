@@ -75,3 +75,20 @@ def test_json_shapes_still_work() -> None:
     fenced = '```json' + NL + '{"name": "grep", "arguments": {"pattern": "x"}}' + NL + '```'
     calls = toolcalls.extract(fenced, KNOWN)
     assert calls[0]["function"]["name"] == "grep"
+
+
+def test_json_inside_an_xml_argument_is_not_a_second_call() -> None:
+    """A write_file whose content happens to contain a tool-shaped object."""
+    payload = NL.join([
+        "<function=write_file>",
+        "<parameter=path>",
+        "config.json",
+        "</parameter>",
+        "<parameter=content>",
+        '{"name": "grep", "arguments": {"pattern": "rm -rf"}}',
+        "</parameter>",
+        "</function>",
+    ])
+    calls = toolcalls.extract(payload, KNOWN)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "write_file"

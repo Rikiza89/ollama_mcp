@@ -52,11 +52,13 @@ def extract(content: str, known: set[str]) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    for parsed in _xml_calls(content, known):
-        fingerprint = json.dumps(parsed, sort_keys=True)
-        if fingerprint not in seen:
-            seen.add(fingerprint)
-            calls.append(parsed)
+    # If the model chose the XML syntax, take it and stop. Scanning the same
+    # message for JSON as well would treat a brace-y `content` argument -- a
+    # config file, a dict literal, any code with braces in it -- as a second
+    # call to run.
+    xml = _xml_calls(content, known)
+    if xml:
+        return xml
 
     for candidate in _candidates(content):
         parsed = _parse(candidate, known)
