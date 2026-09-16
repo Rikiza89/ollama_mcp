@@ -58,11 +58,16 @@ class GateResult:
         return "\n\n".join(f"[{c.name}]\n{c.output}".strip() for c in self.checks if not c.ok)
 
 
-def run(cfg: Config, touched: list[Path]) -> GateResult:
+def run(
+    cfg: Config,
+    touched: list[Path],
+    originals: dict[Path, bytes | None] | None = None,
+) -> GateResult:
     checks: list[Check] = []
 
     syntax = _syntax_checks(touched)
     checks.extend(syntax)
+    checks.extend(_structure_checks(touched, originals or {}))
 
     commands = cfg.gate.commands or (autodetect(cfg) if cfg.gate.autodetect else [])
     for cmd in commands:
@@ -104,6 +109,70 @@ def _syntax_checks(touched: list[Path]) -> list[Check]:
         except (SyntaxError, ValueError, OSError) as exc:
             checks.append(Check(f"syntax:{path.name}", False, str(exc)[:MAX_OUTPUT_CHARS]))
     return checks
+
+
+def _structure_checks(
+    touched: list[Path], originals: dict[Path, bytes | None]
+) -> list[Check]:
+    """Did the edit quietly delete code?
+
+    A syntax check cannot see this. A 310-line module rewritten down to its
+    docstring and a couple of constants parses perfectly -- and that is exactly
+    what came back once: every class and function gone, `gate: pass`, reported
+    as APPLIED. The tree was only saved because the caller happened to diff it.
+
+    So compare what the file defines now against what it defined before. Losing
+    a top-level name is never what a comment edit, a docstring translation or a
+    rename was supposed to do, and a model that genuinely means to delete a
+    function is better off being told to say so.
+
+    Only losses are reported. Additions are ordinary.
+    """
+    checks: list[Check] = []
+    for path in touched:
+        before = originals.get(path)
+        if before is None or path.suffix.lower() != ".py" or not path.is_file():
+            continue          # newly created, or nothing to compare against
+        try:
+            was = _defined_names(before)
+            now = _defined_names(path.read_bytes())
+        except (SyntaxError, ValueError, OSError):
+            continue          # the syntax check already has an opinion on this
+        lost = sorted(was - now)
+        if lost:
+            checks.append(
+                Check(
+                    f"structure:{path.name}",
+                    False,
+                    f"{len(lost)} definition(s) disappeared: {', '.join(lost[:12])}"
+                    + ("..." if len(lost) > 12 else "")
+                    + ". An edit to comments or strings must not remove code.",
+                )
+            )
+        else:
+            checks.append(Check(f"structure:{path.name}", True))
+    return checks
+
+
+def _defined_names(source: bytes) -> set[str]:
+    """Every name the module defines or imports.
+
+    Imports count. Losing `import numpy as np` leaves a file that still parses
+    and still defines every class it did before -- and raises NameError the
+    first time it runs. That is exactly how a translated module got through the
+    definitions-only version of this check with both its imports deleted.
+    """
+    tree = ast.parse(source)
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Import):
+            names.update(f"import {alias.name}" for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or "."
+            names.update(f"from {module} import {alias.name}" for alias in node.names)
+    return names
 
 
 def autodetect(cfg: Config) -> list[list[str]]:

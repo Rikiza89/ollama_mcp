@@ -437,9 +437,26 @@ class ToolBelt:
             block += newline
 
         self._snapshot(target)
-        write_source(target, "".join(lines[: lo - 1]) + block + "".join(lines[hi:]), codec)
+        updated = "".join(lines[: lo - 1]) + block + "".join(lines[hi:])
+        write_source(target, updated, codec)
         self.touched.add(target)
-        return f"OK: replaced lines {lo}-{hi} of {rel(self.cfg, target)}"
+
+        # Say so loudly when the range did not keep its line count. A model that
+        # writes one range and then addresses the next by the numbering it read
+        # at the start will write over the wrong place -- observed corrupting a
+        # 574-line template into 650 lines with a dozen duplicated <div>s.
+        written = len(block.splitlines())
+        replaced = hi - lo + 1
+        total = len(updated.splitlines())
+        note = f"OK: replaced lines {lo}-{hi} of {rel(self.cfg, target)}"
+        if written != replaced:
+            return (
+                f"{note} with {written} lines (was {replaced}). LINE NUMBERS BELOW "
+                f"{lo} HAVE SHIFTED BY {written - replaced:+d}; the file is now {total} "
+                f"lines. Call read_file again before your next edit -- any line number "
+                f"you noted earlier is now wrong."
+            )
+        return f"{note} ({written} lines, file unchanged in length)"
 
     def _t_grep(self, pattern: str, glob: str | None = None, max_results: int = 80) -> str:
         limit = max(1, max_results)

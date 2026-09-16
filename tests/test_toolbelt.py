@@ -455,3 +455,30 @@ def test_range_arguments_are_coerced_from_the_text_channel(block: ToolBelt) -> N
         {"path": "t.css", "content": "/* x */", "start_line": "2", "end_line": "4"},
     )
     assert out.startswith("OK: replaced lines 2-4")
+
+
+def test_a_range_write_that_changes_length_says_so(block: ToolBelt) -> None:
+    """The failure this prevents corrupted a real file.
+
+    A model wrote one range, then addressed the next by the line numbers it had
+    read at the start -- which the first write had already invalidated. A
+    574-line template came back 650 lines with a dozen duplicated <div>s.
+    """
+    out = block.run(
+        "write_file",
+        {"path": "t.css", "content": "/* one */\n/* two */\n/* three */\n/* four */",
+         "start_line": 2, "end_line": 4},
+    )
+    assert out.startswith("OK:")
+    assert "SHIFTED BY +1" in out
+    assert "read_file again" in out
+    assert "now 6 lines" in out
+
+
+def test_a_same_length_range_write_says_nothing_alarming(block: ToolBelt) -> None:
+    out = block.run(
+        "write_file",
+        {"path": "t.css", "content": "/* a */\n/* b */\n/* c */", "start_line": 2, "end_line": 4},
+    )
+    assert "SHIFTED" not in out
+    assert "unchanged in length" in out

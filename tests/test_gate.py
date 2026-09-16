@@ -166,3 +166,90 @@ def test_a_non_string_argument_is_rejected(tmp_path: Path) -> None:
 def test_a_well_formed_command_still_loads(tmp_path: Path) -> None:
     toml = '[gate]' + chr(10) + 'commands = [["ruff", "check", "."]]' + chr(10)
     assert _cfg(tmp_path, toml).gate.commands == [["ruff", "check", "."]]
+
+
+# --- an edit must not quietly delete code -----------------------------------
+
+
+def _module(tmp_path: Path) -> Path:
+    src = tmp_path / "guards.py"
+    src.write_text(
+        '"""Docstring."""\n\n'
+        "THRESHOLD = 3\n\n\n"
+        "class GuardReport:\n"
+        "    def summary(self):\n"
+        "        return 1\n\n\n"
+        "def focus_score(gray):\n"
+        "    return 0.0\n",
+        encoding="utf-8",
+    )
+    return src
+
+
+def test_a_truncated_module_fails_even_though_it_parses(tmp_path: Path) -> None:
+    """The failure a syntax check cannot see.
+
+    A 310-line module came back as 74 lines -- docstring and constants only,
+    every class and function gone. It was valid Python, so the gate said pass
+    and the receipt said APPLIED.
+    """
+    src = _module(tmp_path)
+    original = src.read_bytes()
+    src.write_text('"""Docstring tradotta."""\n\nTHRESHOLD = 3\n', encoding="utf-8")
+
+    result = gate.run(_cfg(tmp_path), [src], {src: original})
+    assert not result.ok
+    failures = result.failures()
+    assert "GuardReport" in failures
+    assert "focus_score" in failures
+    assert "must not remove code" in failures
+
+
+def test_translating_a_docstring_keeps_the_gate_green(tmp_path: Path) -> None:
+    src = _module(tmp_path)
+    original = src.read_bytes()
+    src.write_text(
+        src.read_text(encoding="utf-8").replace('"""Docstring."""', '"""Stringa di documentazione."""'),
+        encoding="utf-8",
+    )
+    assert gate.run(_cfg(tmp_path), [src], {src: original}).ok
+
+
+def test_adding_a_function_is_fine(tmp_path: Path) -> None:
+    src = _module(tmp_path)
+    original = src.read_bytes()
+    src.write_text(src.read_text(encoding="utf-8") + "\n\ndef extra():\n    return 2\n", encoding="utf-8")
+    assert gate.run(_cfg(tmp_path), [src], {src: original}).ok
+
+
+def test_a_newly_created_file_has_nothing_to_compare(tmp_path: Path) -> None:
+    src = tmp_path / "fresh.py"
+    src.write_text("def f():\n    return 1\n", encoding="utf-8")
+    assert gate.run(_cfg(tmp_path), [src], {src: None}).ok
+
+
+def test_a_deleted_import_fails_the_gate(tmp_path: Path) -> None:
+    """Still parses, still defines every class, raises NameError when run.
+
+    A translated module lost `import cv2` and `import numpy as np` and sailed
+    through a definitions-only structure check.
+    """
+    src = tmp_path / "mod.py"
+    src.write_text(
+        "import cv2\nimport numpy as np\n\n\ndef work(a):\n    return np.array(a)\n",
+        encoding="utf-8",
+    )
+    original = src.read_bytes()
+    src.write_text("def work(a):\n    return np.array(a)\n", encoding="utf-8")
+
+    result = gate.run(_cfg(tmp_path), [src], {src: original})
+    assert not result.ok
+    assert "import numpy" in result.failures()
+
+
+def test_a_from_import_is_covered_too(tmp_path: Path) -> None:
+    src = tmp_path / "mod.py"
+    src.write_text("from pathlib import Path\n\n\ndef f():\n    return Path('.')\n", encoding="utf-8")
+    original = src.read_bytes()
+    src.write_text("def f():\n    return Path('.')\n", encoding="utf-8")
+    assert not gate.run(_cfg(tmp_path), [src], {src: original}).ok
