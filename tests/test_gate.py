@@ -226,3 +226,30 @@ def test_a_newly_created_file_has_nothing_to_compare(tmp_path: Path) -> None:
     src = tmp_path / "fresh.py"
     src.write_text("def f():\n    return 1\n", encoding="utf-8")
     assert gate.run(_cfg(tmp_path), [src], {src: None}).ok
+
+
+def test_a_deleted_import_fails_the_gate(tmp_path: Path) -> None:
+    """Still parses, still defines every class, raises NameError when run.
+
+    A translated module lost `import cv2` and `import numpy as np` and sailed
+    through a definitions-only structure check.
+    """
+    src = tmp_path / "mod.py"
+    src.write_text(
+        "import cv2\nimport numpy as np\n\n\ndef work(a):\n    return np.array(a)\n",
+        encoding="utf-8",
+    )
+    original = src.read_bytes()
+    src.write_text("def work(a):\n    return np.array(a)\n", encoding="utf-8")
+
+    result = gate.run(_cfg(tmp_path), [src], {src: original})
+    assert not result.ok
+    assert "import numpy" in result.failures()
+
+
+def test_a_from_import_is_covered_too(tmp_path: Path) -> None:
+    src = tmp_path / "mod.py"
+    src.write_text("from pathlib import Path\n\n\ndef f():\n    return Path('.')\n", encoding="utf-8")
+    original = src.read_bytes()
+    src.write_text("def f():\n    return Path('.')\n", encoding="utf-8")
+    assert not gate.run(_cfg(tmp_path), [src], {src: original}).ok

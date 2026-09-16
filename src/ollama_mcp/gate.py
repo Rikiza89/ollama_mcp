@@ -155,13 +155,24 @@ def _structure_checks(
 
 
 def _defined_names(source: bytes) -> set[str]:
-    """Every function and class the module defines, at any nesting level."""
+    """Every name the module defines or imports.
+
+    Imports count. Losing `import numpy as np` leaves a file that still parses
+    and still defines every class it did before -- and raises NameError the
+    first time it runs. That is exactly how a translated module got through the
+    definitions-only version of this check with both its imports deleted.
+    """
     tree = ast.parse(source)
-    return {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    }
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Import):
+            names.update(f"import {alias.name}" for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or "."
+            names.update(f"from {module} import {alias.name}" for alias in node.names)
+    return names
 
 
 def autodetect(cfg: Config) -> list[list[str]]:
